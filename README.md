@@ -1,6 +1,6 @@
 # agentflow
 
-[![PyPI version](https://badge.fury.io/py/agentflow-py.svg)](https://pypi.org/project/agentflow-py/)
+[![PyPI version](https://badge.fury.io/py/agentflowkit.svg)](https://pypi.org/project/agentflowkit/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
@@ -15,7 +15,7 @@ Lightweight multi-agent AI pipeline framework. Define agents with decorators, wi
 ## Install
 
 ```bash
-pip install agentflow-py
+pip install agentflowkit
 ```
 
 ## Quick Start
