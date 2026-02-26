@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentflow-py"
+name = "agentflowkit"
 version = "0.1.0"
 description = "Lightweight multi-agent AI pipeline framework with decorator-based API"
 readme = "README.md"
