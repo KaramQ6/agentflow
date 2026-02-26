@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentflow-py"
+version = "0.1.0"
+description = "Lightweight multi-agent AI pipeline framework with decorator-based API"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "KaramQ6" }]
+keywords = ["ai", "agents", "multi-agent", "llm", "pipeline", "async"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "build",
+]
+
+[project.urls]
+Homepage = "https://github.com/KaramQ6/agentflow"
+Repository = "https://github.com/KaramQ6/agentflow"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentflow"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
