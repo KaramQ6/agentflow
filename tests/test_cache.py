@@ -1,12 +1,9 @@
 """Tests for LLM response caching."""
 
-import asyncio
 import time
 
 import pytest
-
 from agentflow.cache import InMemoryCache, ResponseCache
-
 
 # ─── InMemoryCache ─────────────────────────────────────────────────────────────
 
@@ -94,6 +91,7 @@ def test_cache_key_is_order_stable():
 async def test_llm_cache_hit_skips_api_call():
     """When cache has a hit, the OpenAI client must NOT be called."""
     from unittest.mock import AsyncMock, MagicMock
+
     from agentflow.llm import LLM
 
     cache = InMemoryCache()
@@ -115,6 +113,7 @@ async def test_llm_cache_hit_skips_api_call():
 async def test_llm_cache_miss_stores_result():
     """After a successful API call, the result must be stored in the cache."""
     from unittest.mock import AsyncMock, MagicMock
+
     from agentflow.llm import LLM
 
     cache = InMemoryCache()

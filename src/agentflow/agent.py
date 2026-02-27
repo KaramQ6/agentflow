@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Awaitable, Type
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from .exceptions import AgentError, AgentOutputValidationError
 from .llm import LLM
 from .types import AgentResult
-from .exceptions import AgentError, AgentOutputValidationError
 
 
 class BaseAgent(ABC):
@@ -49,7 +50,7 @@ class _DecoratorAgent:
         name: str,
         role: str,
         prompt_fn: Callable[..., Awaitable[str]],
-        output_schema: Type[BaseModel] | None = None,
+        output_schema: type[BaseModel] | None = None,
     ):
         self.name = name
         self.role = role
@@ -125,7 +126,7 @@ class Agent:
             return f"Summarize as JSON: {task}"
     """
 
-    def __init__(self, name: str, role: str, output_schema: Type[BaseModel] | None = None):
+    def __init__(self, name: str, role: str, output_schema: type[BaseModel] | None = None):
         self.name = name
         self.role = role
         self._output_schema = output_schema
