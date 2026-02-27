@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
 
-from .agent import _DecoratorAgent, BaseAgent
+from .agent import BaseAgent, _DecoratorAgent
 from .events import EventEmitter
 from .exceptions import AgentError, AgentTimeoutError, PipelineError
 from .llm import LLM
 from .types import AgentResult, Event, PipelineResult
-
 
 AgentLike = _DecoratorAgent | BaseAgent
 
@@ -61,7 +60,7 @@ class Pipeline:
         depends_on: list[str] | None = None,
         timeout: float | None = None,
         condition: Callable[[dict[str, str]], bool] | None = None,
-    ) -> "Pipeline":
+    ) -> Pipeline:
         """Add an agent to the pipeline.
 
         Args:
@@ -201,7 +200,7 @@ class Pipeline:
 
             level_results = await asyncio.gather(*level_coros, return_exceptions=True)
 
-            for node, result in zip(to_run, level_results):
+            for node, result in zip(to_run, level_results, strict=False):
                 if isinstance(result, BaseException):
                     raise result
                 results[node.agent.name] = result
@@ -261,7 +260,7 @@ class Pipeline:
 
                     level_results = await asyncio.gather(*level_coros, return_exceptions=True)
 
-                    for node, result in zip(to_run, level_results):
+                    for node, result in zip(to_run, level_results, strict=False):
                         if isinstance(result, BaseException):
                             emitter.emit("agent_error", agent=node.agent.name, error=str(result))
                             raise result

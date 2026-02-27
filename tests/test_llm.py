@@ -1,8 +1,6 @@
 """Tests for the LLM provider."""
 
-import pytest
 from agentflow import LLM
-from agentflow.exceptions import LLMError
 
 
 def test_llm_init_defaults():
