@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Type
+
+from pydantic import BaseModel, ValidationError
 
 from .llm import LLM
 from .types import AgentResult
-from .exceptions import AgentError
+from .exceptions import AgentError, AgentOutputValidationError
 
 
 class BaseAgent(ABC):
@@ -42,10 +44,17 @@ class BaseAgent(ABC):
 class _DecoratorAgent:
     """Agent created via the @Agent decorator."""
 
-    def __init__(self, name: str, role: str, prompt_fn: Callable[..., Awaitable[str]]):
+    def __init__(
+        self,
+        name: str,
+        role: str,
+        prompt_fn: Callable[..., Awaitable[str]],
+        output_schema: Type[BaseModel] | None = None,
+    ):
         self.name = name
         self.role = role
         self._prompt_fn = prompt_fn
+        self._output_schema = output_schema
 
     async def execute(self, task: str, context: dict[str, str], llm: LLM) -> AgentResult:
         start = time.perf_counter()
@@ -64,13 +73,24 @@ class _DecoratorAgent:
         except Exception as e:
             raise AgentError(self.name, str(e)) from e
 
+        content = response["content"]
+        metadata: dict[str, Any] = {"model": response["model"]}
+
+        if self._output_schema is not None:
+            try:
+                validated = self._output_schema.model_validate_json(content)
+                metadata["validated_output"] = validated.model_dump()
+            except ValidationError as e:
+                raise AgentOutputValidationError(self.name, str(e)) from e
+
         duration = time.perf_counter() - start
         return AgentResult(
             agent=self.name,
-            output=response["content"],
+            output=content,
             tokens_used=response["tokens"],
             duration=round(duration, 3),
-            metadata={"model": response["model"]},
+            cached=response.get("cached", False),
+            metadata=metadata,
         )
 
     def __repr__(self) -> str:
@@ -83,15 +103,32 @@ class Agent:
     The decorated function receives (task, context) and returns
     the user message to send to the LLM.
 
+    Args:
+        name: Unique identifier for the agent within a pipeline.
+        role: Describes the agent's persona (used as system prompt context).
+        output_schema: Optional Pydantic BaseModel subclass. If provided, the
+                       LLM response must be valid JSON matching the schema, or
+                       AgentOutputValidationError is raised.
+
     Usage:
         @Agent(name="researcher", role="Research Analyst")
         async def researcher(task: str, context: dict) -> str:
             return f"Research this topic: {task}"
+
+        # With structured output:
+        class Summary(BaseModel):
+            title: str
+            points: list[str]
+
+        @Agent(name="summarizer", role="Summarizer", output_schema=Summary)
+        async def summarizer(task: str, context: dict) -> str:
+            return f"Summarize as JSON: {task}"
     """
 
-    def __init__(self, name: str, role: str):
+    def __init__(self, name: str, role: str, output_schema: Type[BaseModel] | None = None):
         self.name = name
         self.role = role
+        self._output_schema = output_schema
 
     def __call__(self, fn: Callable[..., Awaitable[str]]) -> _DecoratorAgent:
-        return _DecoratorAgent(self.name, self.role, fn)
+        return _DecoratorAgent(self.name, self.role, fn, output_schema=self._output_schema)

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI, APIError, RateLimitError
 
 from .exceptions import LLMError
+
+if TYPE_CHECKING:
+    from .cache import ResponseCache
+    from .rate_limiter import RateLimiter
 
 
 class LLM:
@@ -24,6 +28,8 @@ class LLM:
         temperature: Sampling temperature (0.0-2.0).
         max_tokens: Maximum tokens in response.
         max_retries: Number of retries on transient failures.
+        cache: Optional ResponseCache for deduplicating identical requests.
+        rate_limiter: Optional RateLimiter for throttling API calls.
     """
 
     def __init__(
@@ -34,11 +40,15 @@ class LLM:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         max_retries: int = 2,
+        cache: "ResponseCache | None" = None,
+        rate_limiter: "RateLimiter | None" = None,
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_retries = max_retries
+        self._cache = cache
+        self._rate_limiter = rate_limiter
 
         kwargs: dict[str, Any] = {}
         if api_key:
@@ -58,15 +68,28 @@ class LLM:
         """Generate a completion from the LLM.
 
         Returns:
-            Dict with keys: content, tokens, duration, model.
+            Dict with keys: content, tokens, duration, model, cached.
         """
+        effective_model = model or self.model
+
+        # Cache lookup
+        if self._cache is not None:
+            cache_key = self._cache.make_key(messages, effective_model)
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                return {**cached, "cached": True}
+
         start = time.perf_counter()
         last_error = None
 
         for attempt in range(self.max_retries + 1):
+            # Rate limiting per attempt
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
+
             try:
                 response = await self._client.chat.completions.create(
-                    model=model or self.model,
+                    model=effective_model,
                     messages=messages,
                     temperature=temperature if temperature is not None else self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
@@ -75,12 +98,19 @@ class LLM:
                 choice = response.choices[0]
                 usage = response.usage
 
-                return {
+                result: dict[str, Any] = {
                     "content": choice.message.content or "",
                     "tokens": usage.total_tokens if usage else 0,
                     "duration": round(duration, 3),
                     "model": response.model,
+                    "cached": False,
                 }
+
+                # Write to cache
+                if self._cache is not None:
+                    await self._cache.set(cache_key, {k: v for k, v in result.items() if k != "cached"})
+
+                return result
 
             except RateLimitError as e:
                 last_error = e
@@ -92,5 +122,8 @@ class LLM:
                 if attempt < self.max_retries:
                     await asyncio.sleep(1)
                     continue
+            finally:
+                if self._rate_limiter is not None:
+                    self._rate_limiter.release()
 
         raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")
