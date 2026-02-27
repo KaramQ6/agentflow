@@ -6,7 +6,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from openai import AsyncOpenAI, APIError, RateLimitError
+from openai import APIError, AsyncOpenAI, RateLimitError
 
 from .exceptions import LLMError
 
@@ -40,8 +40,8 @@ class LLM:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         max_retries: int = 2,
-        cache: "ResponseCache | None" = None,
-        rate_limiter: "RateLimiter | None" = None,
+        cache: ResponseCache | None = None,
+        rate_limiter: RateLimiter | None = None,
     ):
         self.model = model
         self.temperature = temperature

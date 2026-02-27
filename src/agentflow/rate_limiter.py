@@ -65,7 +65,7 @@ class RateLimiter:
 
             self._request_times.append(time.monotonic())
 
-    async def __aenter__(self) -> "RateLimiter":
+    async def __aenter__(self) -> RateLimiter:
         await self.acquire()
         return self
 
