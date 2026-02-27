@@ -1,7 +1,6 @@
 """Tests for conditional branching in the pipeline."""
 
 import pytest
-
 from agentflow import AgentResult, Pipeline
 from agentflow.agent import BaseAgent
 
