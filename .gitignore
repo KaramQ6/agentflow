@@ -10,3 +10,13 @@ venv/
 .pytest_cache/
 *.egg
 tmpclaude-*
+# AI assistants / agents
+.claude/
+CLAUDE.md
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+AGENTS.md
+chat.md
+tmpclaude-*
