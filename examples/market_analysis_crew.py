@@ -20,11 +20,10 @@ import asyncio
 import os
 import sys
 import time
-from pydantic import BaseModel, Field
 
-from agentflow import Agent, InMemoryCache, LLM, Pipeline, PipelineLogger
+from agentflow import LLM, Agent, InMemoryCache, Pipeline, PipelineLogger
 from agentflow.types import Event
-
+from pydantic import BaseModel, Field
 
 # ─── Output Schema ─────────────────────────────────────────────────────────────
 
@@ -244,7 +243,7 @@ async def main(ticker: str) -> None:
         print(f"  Confidence: {rec.confidence:.0%}")
         print(f"  Horizon:    {rec.time_horizon}")
         print(f"  Rationale:  {rec.price_target_rationale[:200]}")
-        print(f"  Key risks:")
+        print("  Key risks:")
         for risk in rec.key_risks[:3]:
             print(f"    • {risk}")
     else:

@@ -12,7 +12,7 @@ from .types import Event
 class EventEmitter:
     """Async event emitter for pipeline progress."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
     def emit(self, event_type: str, agent: str = "", **data: Any) -> None:

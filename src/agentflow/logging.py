@@ -6,7 +6,13 @@ import json
 import logging
 import sys
 from collections.abc import MutableMapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    _LoggerAdapter = logging.LoggerAdapter[logging.Logger]
+else:
+    # logging.LoggerAdapter is not subscriptable at runtime on Python 3.10.
+    _LoggerAdapter = logging.LoggerAdapter
 
 
 class _JsonFormatter(logging.Formatter):
@@ -53,7 +59,7 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     return logger
 
 
-class PipelineLogger(logging.LoggerAdapter):
+class PipelineLogger(_LoggerAdapter):
     """Context-aware logger that attaches run_id and pipeline name to every record.
 
     Args:

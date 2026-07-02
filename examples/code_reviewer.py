@@ -8,8 +8,7 @@ Requires GROQ_API_KEY environment variable.
 import asyncio
 import os
 
-from agentflow import Agent, Pipeline, LLM
-
+from agentflow import LLM, Agent, Pipeline
 
 llm = LLM(
     model="llama-3.3-70b-versatile",

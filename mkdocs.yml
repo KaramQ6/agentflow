@@ -1,0 +1,66 @@
+site_name: agentflow
+site_description: Lightweight multi-agent AI pipeline framework with parallel DAG execution
+repo_url: https://github.com/KaramQ6/agentflow
+repo_name: KaramQ6/agentflow
+
+theme:
+  name: material
+  icon:
+    logo: material/graph-outline
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            members_order: source
+            show_source: true
+            show_signature_annotations: true
+            separate_signature: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Guides:
+      - Tools & Function Calling: guides/tools.md
+      - Memory & Context: guides/memory.md
+      - Cost & Streaming: guides/cost-streaming.md
+      - Observability: guides/observability.md
+  - API Reference: reference.md

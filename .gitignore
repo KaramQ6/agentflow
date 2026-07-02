@@ -9,7 +9,6 @@ venv/
 .env
 .pytest_cache/
 *.egg
-tmpclaude-*
 # AI assistants / agents
 .claude/
 CLAUDE.md
