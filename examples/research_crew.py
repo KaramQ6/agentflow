@@ -8,8 +8,7 @@ Requires GROQ_API_KEY environment variable or replace the api_key below.
 import asyncio
 import os
 
-from agentflow import Agent, Pipeline, LLM
-
+from agentflow import LLM, Agent, Pipeline
 
 # Configure LLM (Groq free tier)
 llm = LLM(
@@ -69,7 +68,7 @@ async def main():
             print(f"   {event.agent} done ({tokens} tokens, {duration:.1f}s)")
         elif event.type == "pipeline_complete":
             print(f"\n{'=' * 60}")
-            print(f"Pipeline complete!")
+            print("Pipeline complete!")
             print(f"  Total tokens: {event.data.get('total_tokens', 0)}")
             print(f"  Total time: {event.data.get('total_duration', 0):.1f}s")
 

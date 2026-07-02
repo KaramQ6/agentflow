@@ -7,7 +7,48 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.3.0]
+
+### Added
+- **Tool / function calling** (`tools.py`): the `@tool` decorator turns any sync
+  or async Python function into an LLM-callable tool. Argument JSON schemas are
+  generated automatically from type hints via Pydantic. Agents given `tools=[...]`
+  run a bounded **ReAct loop** (call → execute tools → observe → repeat) up to
+  `max_tool_iterations` (default 6). Tool errors are fed back to the model for
+  recovery. New `ToolError` exception; tool-call traces recorded in
+  `AgentResult.metadata["tool_calls"]`.
+- **Cost tracking** (`pricing.py`): built-in USD price tables for common OpenAI
+  and Anthropic models with longest-prefix matching. `LLM.generate()` returns a
+  `cost` (and `prompt_tokens`/`completion_tokens`); `AgentResult.cost` and
+  `PipelineResult.total_cost` aggregate spend. Cache hits bill `0.0`.
+  `register_price()` / `estimate_cost()` are public.
+- **Token streaming**: `LLM.astream()` yields content deltas token-by-token for
+  interactive UIs (honours the rate limiter; no cache/retry mid-stream).
+- **Observability hooks** (`observability.py`): `Hooks` base class + `LoggingHooks`
+  wire the previously-unused `PipelineLogger` into `Pipeline.run()` (which was
+  silent before). A raising hook is caught and warned, never crashing the run.
+- **Production-grade retry**: unified exponential backoff with jitter and
+  `Retry-After` header support. New `LLM(retry_base_delay=, retry_jitter=)` args.
+- **Documentation site**: MkDocs Material + mkdocstrings under `docs/`, deployed
+  via a new `docs.yml` workflow. New `docs` optional-dependency group.
+- New examples: `tool_agent.py`, `streaming_and_cost.py`; and
+  `benchmarks/parallel_speedup.py`.
+
+### Fixed
+- **`py.typed` marker** added — the package advertised `Typing :: Typed` but
+  shipped no marker, so downstream type-checkers saw no types.
+- **Red CI made green**: resolved 1 `ruff` error (B904) and 7 `mypy --strict`
+  errors across `llm.py`, `cache.py`, `logging.py`, `events.py`, `pipeline.py`.
+
+### Changed
+- `__version__` bumped to `0.3.0`.
+- Test coverage raised to ~91%; `fail_under` tightened from 80 → 90.
+- `Pipeline.__init__` gains a `hooks` parameter; `run()` now emits lifecycle
+  events and generates `run_id` up front.
+
+---
+
+## [0.2.0]
 
 ### Added
 - **Parallel execution**: Agents at the same DAG level now run concurrently via

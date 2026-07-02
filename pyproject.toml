@@ -4,13 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentflowkit"
-version = "0.2.0"
-description = "Lightweight multi-agent AI pipeline framework with parallel DAG execution"
+version = "0.3.0"
+description = "Lightweight multi-agent AI pipeline framework with parallel DAG execution, tool calling, and cost tracking"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "KaramQ6" }]
-keywords = ["ai", "agents", "multi-agent", "llm", "pipeline", "async", "dag", "parallel"]
+keywords = [
+    "ai", "agents", "multi-agent", "llm", "pipeline", "async", "dag", "parallel",
+    "tool-calling", "function-calling", "react", "agent-framework",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -29,7 +32,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-redis = ["redis>=5.0"]
+redis = ["redis>=5.0", "chromadb>=0.4"]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.24",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -73,4 +80,4 @@ omit = ["*/tests/*", "*/examples/*"]
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 80
+fail_under = 90

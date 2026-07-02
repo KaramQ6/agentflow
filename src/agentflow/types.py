@@ -23,6 +23,7 @@ class AgentResult(BaseModel):
     agent: str
     output: str
     tokens_used: int = 0
+    cost: float = 0.0
     duration: float = 0.0
     cached: bool = False
     level: int = 0
@@ -36,6 +37,7 @@ class PipelineResult(BaseModel):
     output: str  # Last agent's output
     results: dict[str, AgentResult] = Field(default_factory=dict)
     total_tokens: int = 0
+    total_cost: float = 0.0
     total_duration: float = 0.0
     run_id: str = Field(default_factory=_short_uuid)
     levels_executed: int = 0

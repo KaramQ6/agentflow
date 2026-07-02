@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
 
@@ -10,6 +11,8 @@ from .agent import BaseAgent, _DecoratorAgent
 from .events import EventEmitter
 from .exceptions import AgentError, AgentTimeoutError, PipelineError
 from .llm import LLM
+from .memory import BaseMemory
+from .observability import Hooks, safe_invoke
 from .types import AgentResult, Event, PipelineResult
 
 AgentLike = _DecoratorAgent | BaseAgent
@@ -48,9 +51,19 @@ class Pipeline:
         result = await pipe.run("AI in Healthcare")
     """
 
-    def __init__(self, llm: LLM, retry_failed_agents: int = 0):
+    def __init__(
+        self,
+        llm: LLM,
+        retry_failed_agents: int = 0,
+        hooks: Hooks | None = None,
+        memory: BaseMemory | None = None,
+        session_id: str | None = None,
+    ):
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
+        self._hooks = hooks
+        self._memory = memory
+        self._session_id = session_id
         self._nodes: list[_PipelineNode] = []
         self._agent_names: set[str] = set()
 
@@ -137,10 +150,15 @@ class Pipeline:
         task: str,
         context: dict[str, str],
         level_index: int,
+        session_id: str,
     ) -> AgentResult:
         """Execute a single node with timeout and retry support."""
         agent = node.agent
         attempts = self._retry_failed_agents + 1
+
+        # M3: Set session ID on agents that support memory.
+        if hasattr(agent, 'set_session'):
+            agent.set_session(session_id)
 
         for attempt in range(attempts):
             try:
@@ -149,7 +167,7 @@ class Pipeline:
                     try:
                         result = await asyncio.wait_for(coro, timeout=node.timeout)
                     except asyncio.TimeoutError:
-                        raise AgentTimeoutError(agent.name, node.timeout)
+                        raise AgentTimeoutError(agent.name, node.timeout) from None
                 else:
                     result = await coro
 
@@ -180,6 +198,11 @@ class Pipeline:
         results: dict[str, AgentResult] = {}
         context: dict[str, str] = {}
         last_output = ""
+        run_id = uuid.uuid4().hex[:8]
+        session_id = self._session_id or run_id
+
+        if self._hooks is not None:
+            safe_invoke(self._hooks, "on_pipeline_start", task, run_id, len(self._nodes))
 
         for level_index, level in enumerate(levels):
             # Filter out agents whose condition is not met
@@ -192,9 +215,13 @@ class Pipeline:
             if not to_run:
                 continue
 
+            if self._hooks is not None:
+                for node in to_run:
+                    safe_invoke(self._hooks, "on_agent_start", node.agent.name, level_index)
+
             # Build context scoped to each agent's declared dependencies
             level_coros = [
-                self._execute_node(node, task, {k: v for k, v in context.items() if k in node.depends_on}, level_index)
+                self._execute_node(node, task, {k: v for k, v in context.items() if k in node.depends_on}, level_index, session_id)
                 for node in to_run
             ]
 
@@ -202,23 +229,34 @@ class Pipeline:
 
             for node, result in zip(to_run, level_results, strict=False):
                 if isinstance(result, BaseException):
+                    if self._hooks is not None:
+                        err = result if isinstance(result, Exception) else Exception(str(result))
+                        safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
                     raise result
                 results[node.agent.name] = result
                 context[node.agent.name] = result.output
                 last_output = result.output
+                if self._hooks is not None:
+                    safe_invoke(self._hooks, "on_agent_end", result)
 
         total_tokens = sum(r.tokens_used for r in results.values())
+        total_cost = sum(r.cost for r in results.values())
         total_duration = sum(r.duration for r in results.values())
         cache_hits = sum(1 for r in results.values() if r.cached)
 
-        return PipelineResult(
+        pipeline_result = PipelineResult(
             output=last_output,
             results=results,
             total_tokens=total_tokens,
+            total_cost=round(total_cost, 6),
             total_duration=round(total_duration, 3),
+            run_id=run_id,
             levels_executed=len(levels),
             agents_with_cache_hits=cache_hits,
         )
+        if self._hooks is not None:
+            safe_invoke(self._hooks, "on_pipeline_end", pipeline_result)
+        return pipeline_result
 
     async def stream(self, task: str) -> AsyncGenerator[Event, None]:
         """Execute the pipeline and yield real-time events.
@@ -232,6 +270,7 @@ class Pipeline:
         context: dict[str, str] = {}
 
         async def _run() -> None:
+            session_id = self._session_id or uuid.uuid4().hex[:8]
             try:
                 for level_index, level in enumerate(levels):
                     to_run: list[_PipelineNode] = []
@@ -254,6 +293,7 @@ class Pipeline:
                             task,
                             {k: v for k, v in context.items() if k in node.depends_on},
                             level_index,
+                            session_id,
                         )
                         for node in to_run
                     ]
@@ -277,10 +317,12 @@ class Pipeline:
                         )
 
                 total_tokens = sum(r.tokens_used for r in results.values())
+                total_cost = sum(r.cost for r in results.values())
                 total_duration = sum(r.duration for r in results.values())
                 emitter.emit(
                     "pipeline_complete",
                     total_tokens=total_tokens,
+                    total_cost=round(total_cost, 6),
                     total_duration=round(total_duration, 3),
                     agents_completed=len(results),
                     levels_executed=len(levels),

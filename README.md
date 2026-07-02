@@ -7,16 +7,22 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-Lightweight multi-agent AI pipeline framework. Define agents with decorators, wire them into a DAG, and run independent stages **in parallel** with built-in caching, timeouts, and real-time streaming.
+Lightweight multi-agent AI pipeline framework. Define agents with decorators, give them **tools**, wire them into a DAG, and run independent stages **in parallel** — with built-in cost tracking, caching, timeouts, streaming, and observability.
 
+- **Tool / function calling** — `@tool` turns any Python function into an LLM tool; agents run a bounded ReAct loop
 - **Parallel execution** — agents with no inter-dependencies run concurrently via `asyncio.gather()`
+- **Cost tracking** — per-agent and per-pipeline USD cost from built-in pricing tables
+- **Token streaming** — `LLM.astream()` yields tokens for interactive UIs
 - **Decorator-based** — define agents as plain async functions, no boilerplate
 - **LLM response caching** — in-memory (or Redis) cache cuts cost on repeated runs
-- **Per-agent timeouts** — `Pipeline.add(timeout=5.0)` raises `AgentTimeoutError` on slow agents
+- **Per-agent timeouts & retries** — `timeout=` and pipeline-level retry with exponential backoff + jitter
 - **Conditional branching** — skip agents dynamically based on upstream outputs
-- **Structured logging** — JSON-formatted pipeline logs with run IDs for production observability
-- **Provider agnostic** — any OpenAI-compatible API (OpenAI, Groq, Together, Ollama, vLLM)
+- **Observability** — lifecycle `Hooks` + structured JSON logs with run IDs
+- **Provider agnostic** — any OpenAI-compatible API (OpenAI, Groq, Together, Ollama, vLLM, OpenRouter)
+- **Fully typed** — ships `py.typed`; passes `mypy --strict`
 - **Minimal deps** — only `openai` + `pydantic`
+
+📖 **[Full documentation →](https://KaramQ6.github.io/agentflow/)**
 
 ## Install
 
@@ -78,12 +84,48 @@ pipe.add(writer, depends_on=["researcher", "fact_checker"])
 async def main():
     result = await pipe.run("AI in Healthcare")
     print(result.output)
-    print(f"Run ID: {result.run_id} | Tokens: {result.total_tokens} | Levels: {result.levels_executed}")
+    print(f"Run ID: {result.run_id} | Tokens: {result.total_tokens} | Cost: ${result.total_cost:.6f}")
 
 asyncio.run(main())
 ```
 
 ## Features
+
+### Tool / Function Calling
+
+Give an agent tools and it becomes a **ReAct agent**: the model decides which
+functions to call, agentflow runs them, feeds results back, and repeats until a
+final answer. Schemas are generated from your type hints — you never write JSON.
+
+```python
+from agentflow import Agent, Pipeline, LLM, tool
+
+@tool
+def get_stock_price(ticker: str) -> dict:
+    """Look up the latest price for a stock ticker."""
+    return {"ticker": ticker, "price": 229.87}
+
+@tool
+def calculator(expression: str) -> float:
+    """Evaluate an arithmetic expression like '10 * 229.87'."""
+    return eval(expression, {"__builtins__": {}}, {})
+
+@Agent(name="analyst", role="Financial Analyst", tools=[get_stock_price, calculator])
+async def analyst(task: str, context: dict) -> str:
+    return task
+
+pipe = Pipeline(llm=llm)
+pipe.add(analyst)
+result = await pipe.run("What do 10 shares of AAPL cost?")
+
+# Inspect the tool calls the model made:
+for call in result.get("analyst").metadata["tool_calls"]:
+    print(call["tool"], call["arguments"], "->", call["result"])
+```
+
+Sync and async tools both work (sync tools run in a thread). The loop is bounded
+by `max_tool_iterations` (default 6), and tool errors are fed back to the model
+to recover rather than crashing the run.
 
 ### Parallel Execution
 
@@ -117,6 +159,49 @@ llm = LLM(model="gpt-4o", cache=RedisCache(url="redis://localhost:6379/0"))
 ```
 
 Cache hits appear in results: `result.agents_with_cache_hits`, `agent_result.cached`.
+
+### Cost Tracking
+
+Every result carries an estimated USD cost from built-in per-model pricing:
+
+```python
+result = await pipe.run("Summarize the news")
+print(f"Agent cost:    ${result.get('summarizer').cost:.6f}")
+print(f"Pipeline cost: ${result.total_cost:.6f}")
+
+# Register prices for custom / self-hosted models (unknown models cost $0):
+from agentflow import register_price
+register_price("my-finetuned-model", prompt_per_1m=0.50, completion_per_1m=1.50)
+```
+
+Prices use longest-prefix matching, so `gpt-4o-2024-08-06` resolves to `gpt-4o`.
+Cache hits bill `$0.00`.
+
+### Token Streaming
+
+Stream a completion token-by-token for interactive UIs:
+
+```python
+messages = [{"role": "user", "content": "Explain async pipelines in one line."}]
+async for token in llm.astream(messages):
+    print(token, end="", flush=True)
+```
+
+### Observability
+
+`Pipeline.run()` is silent by default. Pass `Hooks` to observe the full lifecycle
+and bridge to logging, metrics, OpenTelemetry, or Langfuse:
+
+```python
+from agentflow import Pipeline, LoggingHooks
+
+pipe = Pipeline(llm=llm, hooks=LoggingHooks("research-pipeline"))
+result = await pipe.run("AI in Healthcare")
+# → {"event": "agent_complete", "agent": "writer", "tokens": 812, "cached": false, ...}
+```
+
+Subclass `Hooks` and override `on_agent_start` / `on_agent_end` / … to emit spans
+to your own backend. A hook that raises is caught and warned, never crashing the run.
 
 ### Per-Agent Timeouts
 
@@ -219,12 +304,16 @@ log.log_pipeline_complete(result.run_id, result.total_tokens, result.total_durat
 | Feature | agentflowkit | LangChain | CrewAI |
 |---------|:---:|:---:|:---:|
 | Parallel DAG execution | ✅ | Partial | ❌ |
+| Tool / function calling | ✅ | ✅ | ✅ |
+| Built-in cost tracking | ✅ | Partial | ❌ |
+| Token streaming | ✅ | ✅ | Partial |
 | Install size | ~2 deps | 100+ deps | 30+ deps |
 | Async-first | ✅ | Partial | ❌ |
 | Decorator API | ✅ | ❌ | ❌ |
 | Built-in response cache | ✅ | Via callbacks | ❌ |
-| Pydantic v2 models | ✅ | v1/v2 mixed | Pydantic v2 |
-| Lines of core code | ~600 | ~200k | ~15k |
+| Observability hooks | ✅ | ✅ | Partial |
+| Fully typed (`py.typed`, strict) | ✅ | Partial | Partial |
+| Lines of core code | ~1.4k | ~200k | ~15k |
 | Per-agent timeout | ✅ | ❌ | ❌ |
 | Conditional branching | ✅ | ✅ | Partial |
 
@@ -279,9 +368,12 @@ llm = LLM(model="meta-llama/Llama-3-70b-chat-hf",
 
 ## Examples
 
+- [`examples/tool_agent.py`](examples/tool_agent.py) — a ReAct agent that calls tools (calculator + stock lookup)
+- [`examples/streaming_and_cost.py`](examples/streaming_and_cost.py) — token streaming + USD cost tracking
 - [`examples/research_crew.py`](examples/research_crew.py) — 3-agent sequential research pipeline
 - [`examples/code_reviewer.py`](examples/code_reviewer.py) — 2-agent code review pipeline
 - [`examples/market_analysis_crew.py`](examples/market_analysis_crew.py) — 5-agent parallel market analysis (diamond DAG)
+- [`benchmarks/parallel_speedup.py`](benchmarks/parallel_speedup.py) — measured parallel vs. sequential speedup (~2×)
 
 ## Contributing
 

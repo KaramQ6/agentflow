@@ -27,9 +27,9 @@ class ResponseCache(ABC):
         ...
 
     @staticmethod
-    def make_key(messages: list[dict[str, str]], model: str) -> str:
+    def make_key(messages: list[dict[str, Any]], model: str) -> str:
         """Deterministic SHA-256 cache key from messages + model."""
-        payload = json.dumps({"messages": messages, "model": model}, sort_keys=True)
+        payload = json.dumps({"messages": messages, "model": model}, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -78,7 +78,7 @@ class InMemoryCache(ResponseCache):
 
 
 try:
-    import redis.asyncio as aioredis  # type: ignore[import-untyped]
+    import redis.asyncio as aioredis
     _REDIS_AVAILABLE = True
 except ImportError:
     _REDIS_AVAILABLE = False
@@ -120,7 +120,8 @@ class RedisCache(ResponseCache):
         raw = await self._client.get(self._full_key(key))
         if raw is None:
             return None
-        return json.loads(raw)
+        data: dict[str, Any] = json.loads(raw)
+        return data
 
     async def set(self, key: str, value: dict[str, Any], ttl: int | None = None) -> None:
         await self._client.setex(
