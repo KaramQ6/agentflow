@@ -91,8 +91,8 @@ class Tool:
         except Exception as e:  # pydantic ValidationError or TypeError
             raise ToolError(self.name, f"argument validation failed: {e}") from e
 
-        kwargs = {k: getattr(validated, k) for k in arguments}
         try:
+            kwargs = {k: getattr(validated, k) for k in type(validated).model_fields}
             if self._is_async:
                 result = await self.func(**kwargs)
             else:

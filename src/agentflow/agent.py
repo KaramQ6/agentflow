@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from .exceptions import AgentError, AgentOutputValidationError, ToolError
+from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
 from .memory import BaseMemory
 from .tools import Tool
@@ -81,12 +82,17 @@ class _DecoratorAgent:
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
         self._session_id = "default"
+        self._approval_policy: ApprovalPolicy | None = None
         # B5/B8: Pre-compute tool schemas once at construction time.
         self._openai_tools = [t.openai_schema for t in self._tools]
 
     def set_session(self, session_id: str) -> None:
         """Set the session ID used for memory load/save operations."""
         self._session_id = session_id
+
+    def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
+        """Attach an HITL approval policy that intercepts tool calls before execution."""
+        self._approval_policy = policy
 
     async def execute(self, task: str, context: dict[str, str], llm: LLM) -> AgentResult:
         start = time.perf_counter()
@@ -154,7 +160,14 @@ class _DecoratorAgent:
         )
 
     async def _run_tool_loop(
-        self, messages: list[dict[str, Any]], llm: LLM
+        self,
+        messages: list[dict[str, Any]],
+        llm: LLM,
+        start_iteration: int = 0,
+        initial_total_tokens: int = 0,
+        initial_total_cost: float = 0.0,
+        initial_trace: list[dict[str, Any]] | None = None,
+        initial_seen_calls: set[tuple[str, str]] | None = None,
     ) -> tuple[str, int, float, str, list[dict[str, Any]]]:
         """Drive a ReAct-style loop: call the LLM, run any requested tools, repeat.
 
@@ -165,17 +178,21 @@ class _DecoratorAgent:
         - Message list is trimmed to prevent context overflow (B2).
         - Transient LLM errors are retried once per iteration (B7).
 
+        When *start_iteration* > 0 the loop resumes from a prior
+        :class:`~agentflow.hitl.PauseExecution`, preserving accumulated tokens,
+        cost, trace, and seen-calls state.
+
         Returns:
             (final_content, total_tokens, total_cost, model_name, tool_call_trace)
         """
         tool_map = {t.name: t for t in self._tools}
-        total_tokens = 0
-        total_cost = 0.0
+        total_tokens = initial_total_tokens
+        total_cost = initial_total_cost
         model_name = llm.model
-        trace: list[dict[str, Any]] = []
-        seen_calls: set[tuple[str, str]] = set()
+        trace: list[dict[str, Any]] = initial_trace or []
+        seen_calls: set[tuple[str, str]] = initial_seen_calls or set()
 
-        for iteration in range(self._max_tool_iterations):
+        for iteration in range(start_iteration, self._max_tool_iterations):
             # B7: Per-iteration LLM retry for transient failures.
             for retry in range(LLM_RETRIES_PER_ITERATION + 1):
                 try:
@@ -232,6 +249,31 @@ class _DecoratorAgent:
                         self.name, name, arguments[:120],
                     )
                 else:
+                    # HITL: check approval policy before dispatching.
+                    if self._approval_policy is not None and self._approval_policy.requires_approval(
+                        name, arguments
+                    ):
+                        pending: list[dict[str, Any]] = []
+                        pause_idx = tool_calls.index(call)
+                        for rc in tool_calls[pause_idx:]:
+                            rfn = rc["function"]
+                            rkey = (rfn["name"], rfn["arguments"])
+                            if rkey not in seen_calls:
+                                pending.append(rc)
+                        raise PauseExecution(
+                            agent_name=self.name,
+                            tool_name=name,
+                            tool_arguments=arguments,
+                            tool_call_id=call["id"],
+                            messages=messages,
+                            total_tokens=total_tokens,
+                            total_cost=total_cost,
+                            model_name=model_name,
+                            trace=trace,
+                            pending_calls=pending,
+                            seen_calls=[[n, a] for n, a in seen_calls],
+                            iterations_used=iteration,
+                        )
                     seen_calls.add(key)
                     coros.append(
                         (call["id"], asyncio.create_task(self._execute_single_tool(call, tool_map)))
@@ -297,6 +339,128 @@ class _DecoratorAgent:
                 )
 
         return call["id"], name, arguments, output
+
+    async def resume_execution(
+        self,
+        pause_data: dict[str, Any],
+        llm: LLM,
+        approved: bool,
+        human_feedback: str = "",
+    ) -> AgentResult:
+        """Resume execution after a :class:`~agentflow.hitl.PauseExecution`.
+
+        Applies the human decision to the paused tool call, processes any
+        remaining tool calls from the same LLM response batch, then re-enters
+        the ReAct loop from where it left off.
+
+        Args:
+            pause_data: Serialized state from ``PauseExecution.as_dict()``.
+            llm: The LLM provider for continued generation.
+            approved: ``True`` to execute the pending tool; ``False`` to inject
+                      *human_feedback* as an error observation instead.
+            human_feedback: Contextual message injected when *approved* is
+                            ``False`` so the agent can self-correct.
+
+        Returns:
+            An ``AgentResult`` with the final agent output.
+        """
+        start = time.perf_counter()
+        tool_map = {t.name: t for t in self._tools}
+        messages: list[dict[str, Any]] = pause_data["messages"]
+        pending_calls: list[dict[str, Any]] = pause_data.get("pending_calls", [])
+        seen_calls: set[tuple[str, str]] = set(
+            tuple(p) for p in pause_data.get("seen_calls", [])
+        )
+
+        if pending_calls:
+            paused_call = pending_calls[0]
+            if approved:
+                call_id, name, args, output = await self._execute_single_tool(
+                    paused_call, tool_map
+                )
+                output = _truncate_output(output)
+                pause_data["trace"].append(
+                    {"tool": name, "arguments": args, "result": output}
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": call_id, "content": output}
+                )
+            else:
+                name = paused_call["function"]["name"]
+                args = paused_call["function"]["arguments"]
+                messages.append(
+                    {"role": "tool", "tool_call_id": paused_call["id"], "content": human_feedback}
+                )
+                pause_data["trace"].append(
+                    {
+                        "tool": name,
+                        "arguments": args,
+                        "result": f"[HUMAN REJECTED] {human_feedback}",
+                    }
+                )
+
+            for call in pending_calls[1:]:
+                fn = call["function"]
+                key = (fn["name"], fn["arguments"])
+                if key in seen_calls:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": (
+                                f"Error: Duplicate tool call detected. You already called "
+                                f"'{fn['name']}' with these arguments."
+                            ),
+                        }
+                    )
+                else:
+                    seen_calls.add(key)
+                    cid, tname, targs, output = await self._execute_single_tool(
+                        call, tool_map
+                    )
+                    output = _truncate_output(output)
+                    pause_data["trace"].append(
+                        {"tool": tname, "arguments": targs, "result": output}
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": cid, "content": output}
+                    )
+
+        content, tokens_used, cost, model_name, final_trace = await self._run_tool_loop(
+            messages,
+            llm,
+            start_iteration=pause_data["iterations_used"] + 1,
+            initial_total_tokens=pause_data["total_tokens"],
+            initial_total_cost=pause_data["total_cost"],
+            initial_trace=pause_data["trace"],
+            initial_seen_calls=seen_calls,
+        )
+
+        total_tokens = pause_data["total_tokens"] + tokens_used
+        total_cost = pause_data["total_cost"] + cost
+
+        if self._memory is not None and content:
+            await self._memory.save_context(self._session_id, self.name, content)
+
+        if self._output_schema is not None:
+            try:
+                self._output_schema.model_validate_json(content)
+            except Exception as e:
+                raise AgentOutputValidationError(self.name, str(e)) from e
+
+        duration = time.perf_counter() - start
+        return AgentResult(
+            agent=self.name,
+            output=content,
+            tokens_used=total_tokens,
+            cost=round(total_cost, 6),
+            duration=round(duration, 3),
+            cached=False,
+            metadata={
+                "model": model_name,
+                "tool_calls": final_trace,
+            },
+        )
 
     def __repr__(self) -> str:
         return f"Agent(name={self.name!r}, role={self.role!r})"

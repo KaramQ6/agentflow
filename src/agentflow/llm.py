@@ -116,11 +116,10 @@ class LLM:
             extra["tool_choice"] = tool_choice or "auto"
 
         for attempt in range(self.max_retries + 1):
-            # Rate limiting per attempt
-            if self._rate_limiter is not None:
-                await self._rate_limiter.acquire()
-
             try:
+                # Rate limiting per attempt
+                if self._rate_limiter is not None:
+                    await self._rate_limiter.acquire()
                 response = await self._client.chat.completions.create(
                     model=effective_model,
                     messages=cast("list[ChatCompletionMessageParam]", messages),
@@ -196,9 +195,9 @@ class LLM:
             Content string fragments as the model produces them.
         """
         effective_model = model or self.model
-        if self._rate_limiter is not None:
-            await self._rate_limiter.acquire()
         try:
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
             stream = await self._client.chat.completions.create(
                 model=effective_model,
                 messages=cast("list[ChatCompletionMessageParam]", messages),

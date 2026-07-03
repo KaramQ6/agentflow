@@ -8,6 +8,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from .exceptions import AgentFlowError
+
 
 class ResponseCache(ABC):
     """Abstract base for LLM response caches.
@@ -34,9 +36,9 @@ class ResponseCache(ABC):
 
 
 class InMemoryCache(ResponseCache):
-    """Thread-safe in-process LRU-style cache backed by a plain dict.
+    """In-process async-safe FIFO cache backed by a plain dict.
 
-    Suitable for single-process applications and testing.
+    Suitable for single-threaded async applications and testing.
     TTL is enforced lazily on ``get()`` — expired entries are evicted
     when first accessed rather than on a background timer.
 
@@ -117,15 +119,25 @@ class RedisCache(ResponseCache):
         return f"{self._prefix}{key}"
 
     async def get(self, key: str) -> dict[str, Any] | None:
-        raw = await self._client.get(self._full_key(key))
+        try:
+            raw = await self._client.get(self._full_key(key))
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis cache get failed for key {key}: {e}"
+            ) from e
         if raw is None:
             return None
         data: dict[str, Any] = json.loads(raw)
         return data
 
     async def set(self, key: str, value: dict[str, Any], ttl: int | None = None) -> None:
-        await self._client.setex(
-            self._full_key(key),
-            ttl if ttl is not None else self._default_ttl,
-            json.dumps(value),
-        )
+        try:
+            await self._client.setex(
+                self._full_key(key),
+                ttl if ttl is not None else self._default_ttl,
+                json.dumps(value),
+            )
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis cache set failed for key {key}: {e}"
+            ) from e

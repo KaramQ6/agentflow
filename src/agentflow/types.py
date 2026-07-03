@@ -32,7 +32,12 @@ class AgentResult(BaseModel):
 
 
 class PipelineResult(BaseModel):
-    """Result from a full pipeline execution."""
+    """Result from a full pipeline execution.
+
+    When the pipeline is paused by the HITL mechanism, ``status`` is set to
+    ``"paused"`` and ``pause_info`` contains the details of the action
+    awaiting human review.
+    """
 
     output: str  # Last agent's output
     results: dict[str, AgentResult] = Field(default_factory=dict)
@@ -42,6 +47,8 @@ class PipelineResult(BaseModel):
     run_id: str = Field(default_factory=_short_uuid)
     levels_executed: int = 0
     agents_with_cache_hits: int = 0
+    status: str = "completed"
+    pause_info: dict[str, Any] | None = None
 
     def get(self, agent_name: str) -> AgentResult | None:
         """Get a specific agent's result."""
