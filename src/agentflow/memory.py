@@ -17,12 +17,18 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .exceptions import AgentFlowError
+
+if TYPE_CHECKING:
+    from .distillation import ContextDistiller
 
 _log = logging.getLogger("agentflow.memory")
 
 DEFAULT_TTL = 3600
 DEFAULT_MAX_ENTRIES = 1000
+DEFAULT_MAX_SESSIONS = 1000
 
 
 class BaseMemory(ABC):
@@ -52,21 +58,48 @@ class InMemoryContext(BaseMemory):
         default_ttl: Seconds before a stored entry expires (default 3600).
         max_entries: Maximum entries per session before LRU eviction kicks in
                      (default 1000). Set to 0 for unlimited.
+        max_sessions: Maximum number of concurrent sessions before the oldest
+                      (least-recently-used) session is evicted (default 1000).
+                      Set to 0 for unlimited.
     """
 
-    def __init__(self, default_ttl: float = DEFAULT_TTL, max_entries: int = DEFAULT_MAX_ENTRIES):
+    def __init__(
+        self,
+        default_ttl: float = DEFAULT_TTL,
+        max_entries: int = DEFAULT_MAX_ENTRIES,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+    ):
         self._default_ttl = default_ttl
         self._max_entries = max_entries
-        self._store: dict[str, OrderedDict[str, tuple[Any, float]]] = {}
+        self._max_sessions = max_sessions
+        self._store: OrderedDict[str, OrderedDict[str, tuple[Any, float]]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._session_versions: dict[str, int] = {}
+        self._distiller: ContextDistiller | None = None
+
+    def enable_distillation(
+        self, distiller: ContextDistiller, threshold_tokens: int = 4000
+    ) -> None:
+        """Enable background context distillation for this memory store.
+
+        When enabled, every :meth:`save_context` call checks whether the
+        session's token count exceeds *threshold_tokens* and triggers
+        distillation as a non-blocking background task.
+
+        Args:
+            distiller: A configured :class:`~agentflow.distillation.ContextDistiller`.
+            threshold_tokens: Token threshold above which distillation fires.
+        """
+        self._distiller = distiller
 
     async def save_context(self, session_id: str, key: str, value: Any) -> None:
         expiry = time.monotonic() + self._default_ttl
         async with self._lock:
             session = self._store.setdefault(session_id, OrderedDict())
-            # Move to end (most-recently-used) or insert
             session[key] = (value, expiry)
             session.move_to_end(key)
+            # Move session to end (most-recently-used)
+            self._store.move_to_end(session_id)
             # LRU eviction: remove oldest entries when over limit
             if self._max_entries > 0 and len(session) > self._max_entries:
                 excess = len(session) - self._max_entries
@@ -74,6 +107,17 @@ class InMemoryContext(BaseMemory):
                     oldest = next(iter(session))
                     del session[oldest]
                     _log.debug("LRU evicted %s:%s", session_id, oldest)
+            # Session-level LRU eviction: cap total sessions
+            if self._max_sessions > 0 and len(self._store) > self._max_sessions:
+                oldest_sid = next(iter(self._store))
+                del self._store[oldest_sid]
+                _log.debug("LRU evicted session %s", oldest_sid)
+            # Version counter for distillation concurrency safety.
+            self._session_versions[session_id] = self._session_versions.get(session_id, 0) + 1
+
+        # Trigger background distillation without blocking the caller.
+        if self._distiller is not None:
+            asyncio.create_task(self._distiller.maybe_distill(session_id))
 
     async def load_context(self, session_id: str) -> dict[str, Any]:
         now = time.monotonic()
@@ -88,6 +132,8 @@ class InMemoryContext(BaseMemory):
             if not session:
                 del self._store[session_id]
                 return {}
+            # Touch: move to end (most-recently-used)
+            self._store.move_to_end(session_id)
             return {k: v for k, (v, _) in session.items()}
 
     async def clear(self, session_id: str) -> None:
@@ -101,6 +147,87 @@ class InMemoryContext(BaseMemory):
                 session.pop(key, None)
                 if not session:
                     del self._store[session_id]
+                else:
+                    self._store.move_to_end(session_id)
+
+    async def _get_session_snapshot(
+        self, session_id: str
+    ) -> tuple[dict[str, Any], int] | None:
+        """Return a snapshot of *session_id* content plus its version counter.
+
+        Called by :class:`~agentflow.distillation.ContextDistiller` under
+        the memory lock.  Returns ``None`` if the session is empty or missing.
+        """
+        now = time.monotonic()
+        async with self._lock:
+            session = self._store.get(session_id)
+            if session is None:
+                return None
+            content: dict[str, Any] = {}
+            for k, (v, exp) in session.items():
+                if now < exp:
+                    content[k] = v
+            if not content:
+                return None
+            version = self._session_versions.get(session_id, 0)
+            # Return a deep-enough copy: dict and shallow values are fine.
+            return dict(content), version
+
+    async def _replace_distilled(
+        self,
+        session_id: str,
+        expected_content: dict[str, Any],
+        version: int,
+        distilled: str,
+    ) -> bool:
+        """Atomically replace session content with *distilled* if unchanged.
+
+        Called by :class:`~agentflow.distillation.ContextDistiller` after the
+        LLM call completes.  Compares the current session content and version
+        against the snapshot.  If any key was added, modified, or deleted
+        during the distillation call, the replacement is skipped.
+
+        Returns:
+            ``True`` if the replacement succeeded, ``False`` if the session
+            was modified concurrently.
+        """
+        async with self._lock:
+            current_version = self._session_versions.get(session_id, 0)
+            if current_version != version:
+                _log.debug(
+                    "Distillation replacement skipped for %s: "
+                    "version mismatch (%d != %d)",
+                    session_id, current_version, version,
+                )
+                return False
+
+            session = self._store.get(session_id)
+            if session is None:
+                return False
+
+            now = time.monotonic()
+            current_content: dict[str, Any] = {}
+            for k, (v, exp) in session.items():
+                if now < exp:
+                    current_content[k] = v
+
+            if current_content != expected_content:
+                _log.debug(
+                    "Distillation replacement skipped for %s: content changed",
+                    session_id,
+                )
+                return False
+
+            # Atomically replace: clear session, store distilled result.
+            expiry = time.monotonic() + self._default_ttl
+            session.clear()
+            session["_distilled"] = (distilled, expiry)
+            self._session_versions[session_id] = version + 1
+            _log.debug(
+                "Distillation stored for session %s (%d chars)",
+                session_id, len(distilled),
+            )
+            return True
 
 
 # ── Optional dependency guards ────────────────────────────────────────────────
@@ -184,21 +311,41 @@ class RedisContext(BaseMemory):
         return f"{self._prefix}{session_id}"
 
     async def save_context(self, session_id: str, key: str, value: Any) -> None:
-        sk = self._session_key(session_id)
-        await self._client.hset(sk, key, json.dumps(value))
-        if self._ttl is not None:
-            await self._client.expire(sk, self._ttl)
+        try:
+            sk = self._session_key(session_id)
+            await self._client.hset(sk, key, json.dumps(value))
+            if self._ttl is not None:
+                await self._client.expire(sk, self._ttl)
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis save_context failed for session {session_id}: {e}"
+            ) from e
 
     async def load_context(self, session_id: str) -> dict[str, Any]:
-        sk = self._session_key(session_id)
-        raw: dict[str, str] = await self._client.hgetall(sk)
-        return {k: json.loads(v) for k, v in raw.items()}
+        try:
+            sk = self._session_key(session_id)
+            raw: dict[str, str] = await self._client.hgetall(sk)
+            return {k: json.loads(v) for k, v in raw.items()}
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis load_context failed for session {session_id}: {e}"
+            ) from e
 
     async def clear(self, session_id: str) -> None:
-        await self._client.delete(self._session_key(session_id))
+        try:
+            await self._client.delete(self._session_key(session_id))
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis clear failed for session {session_id}: {e}"
+            ) from e
 
     async def delete_key(self, session_id: str, key: str) -> None:
-        await self._client.hdel(self._session_key(session_id), key)
+        try:
+            await self._client.hdel(self._session_key(session_id), key)
+        except Exception as e:
+            raise AgentFlowError(
+                f"Redis delete_key failed for session {session_id}/{key}: {e}"
+            ) from e
 
 
 # ── Vector DB-backed semantic memory ──────────────────────────────────────────
@@ -257,7 +404,8 @@ class VectorContext(BaseMemory):
 
     async def save_context(self, session_id: str, key: str, value: Any) -> None:
         doc = value if isinstance(value, str) else json.dumps(value)
-        self._collection.upsert(
+        await asyncio.to_thread(
+            self._collection.upsert,
             ids=[self._doc_id(session_id, key)],
             documents=[doc],
             metadatas=[{"session_id": session_id, "key": key}],
@@ -265,7 +413,9 @@ class VectorContext(BaseMemory):
 
     async def load_context(self, session_id: str) -> dict[str, Any]:
         try:
-            result = self._collection.get(where={"session_id": session_id})
+            result = await asyncio.to_thread(
+                self._collection.get, where={"session_id": session_id}
+            )
         except Exception:
             _log.debug("load_context: no matching documents for session %s", session_id)
             return {}
@@ -291,7 +441,9 @@ class VectorContext(BaseMemory):
             List of result dicts with keys: ``id``, ``document``, ``metadata``,
             ``distance``.
         """
-        result = self._collection.query(query_texts=[query], n_results=top_k)
+        result = await asyncio.to_thread(
+            self._collection.query, query_texts=[query], n_results=top_k
+        )
         items: list[dict[str, Any]] = []
         ids_batch = result.get("ids")
         docs_batch = result.get("documents")
@@ -311,12 +463,16 @@ class VectorContext(BaseMemory):
 
     async def clear(self, session_id: str) -> None:
         try:
-            result = self._collection.get(where={"session_id": session_id})
+            result = await asyncio.to_thread(
+                self._collection.get, where={"session_id": session_id}
+            )
             ids = result.get("ids") or []
             if ids:
-                self._collection.delete(ids=ids)
+                await asyncio.to_thread(self._collection.delete, ids=ids)
         except Exception:
             _log.debug("clear: no documents to remove for session %s", session_id)
 
     async def delete_key(self, session_id: str, key: str) -> None:
-        self._collection.delete(ids=[self._doc_id(session_id, key)])
+        await asyncio.to_thread(
+            self._collection.delete, ids=[self._doc_id(session_id, key)]
+        )
