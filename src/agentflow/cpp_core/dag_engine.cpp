@@ -1,6 +1,7 @@
 #include "dag_engine.h"
 
 #include <algorithm>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <thread>
