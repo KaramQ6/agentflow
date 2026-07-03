@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.8", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "agentflowkit"
@@ -32,6 +32,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docker = ["docker>=7.0"]
+mqtt = ["aiomqtt>=2.0"]
 redis = ["redis>=5.0", "chromadb>=0.4"]
 docs = [
     "mkdocs-material>=9.5",
@@ -52,8 +54,9 @@ Repository = "https://github.com/KaramQ6/agentflow"
 Changelog = "https://github.com/KaramQ6/agentflow/blob/main/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/KaramQ6/agentflow/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/agentflow"]
+[tool.scikit-build]
+cmake.args = ["-DPYBIND11_FINDPYTHON=ON"]
+wheel.packages = ["src/agentflow"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
