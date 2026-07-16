@@ -229,8 +229,12 @@ async def test_serve_dispatches_all_trigger_items():
     assert len(results) == 3
     result_names = {r.results["echo"].output for r in results}
     assert any("task='task-A'" in o for o in result_names)
-    assert any("task='task-B'" in o for o in result_names)
+    assert any("task-B" in o for o in result_names)
     assert any("task='task-C'" in o for o in result_names)
+    # Non-empty context_data is appended to the prompt as a JSON block.
+    task_b_output = next(o for o in result_names if "task-B" in o)
+    assert "Context data (JSON)" in task_b_output
+    assert '"extra": 1' in task_b_output
 
 
 @pytest.mark.asyncio
