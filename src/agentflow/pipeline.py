@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any
 
-from .agent import BaseAgent, _DecoratorAgent
+from .agent import AgentLike, AgentSpec
 from .events import EventEmitter
 from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
 from .hitl import ApprovalPolicy, PauseExecution
@@ -25,8 +25,6 @@ if TYPE_CHECKING:
     from .triggers import BaseTrigger
 
 _logger = logging.getLogger(__name__)
-
-AgentLike = _DecoratorAgent | BaseAgent
 
 
 class _PipelineNode:
@@ -179,7 +177,7 @@ class Pipeline:
 
         for attempt in range(attempts):
             try:
-                if isinstance(agent, _DecoratorAgent):
+                if isinstance(agent, AgentSpec):
                     # Run-scoped state travels with the call — mutating a
                     # shared agent instance would cross-contaminate
                     # concurrent pipeline runs.
@@ -529,7 +527,7 @@ class Pipeline:
         last_output = next(reversed(results.values())).output if results else ""
 
         # Locate the paused agent in the pipeline.
-        agent: _DecoratorAgent | None = None
+        agent: AgentSpec | None = None
         for node in self._nodes:
             if node.agent.name == paused_name and hasattr(node.agent, "resume_execution"):
                 agent = node.agent  # type: ignore[assignment]

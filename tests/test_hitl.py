@@ -679,3 +679,88 @@ class TestParallelPause:
         assert result.status == "paused"
         # agent_b should have completed since it used a safe tool.
         assert "agent_b" in result.results
+
+
+# ── 0.6 regression tests ──────────────────────────────────────────────────────
+
+
+class TestHITLRegressions:
+    async def test_resume_execution_populates_data(self):
+        """A resumed agent's validated output must reach .data like the normal path."""
+        from pydantic import BaseModel
+
+        class Verdict(BaseModel):
+            ok: bool
+
+        @tool
+        async def send_email(to: str) -> str:
+            return f"Sent to {to}"
+
+        @Agent(name="test_agent", role="Tester", tools=[send_email], output_schema=Verdict)
+        async def schema_agent(task: str, context: dict) -> str:
+            return task
+
+        llm = ScriptedLLM([_response('{"ok": true}')])
+        result = await schema_agent.resume_execution(
+            _make_pause_dict(), llm, approved=True
+        )
+
+        assert result.data == {"ok": True}
+        assert result.metadata["validated_output"] == {"ok": True}
+
+    async def test_resume_does_not_mutate_shared_agent(self):
+        """pipeline.resume must pass run-scoped state, not call set_session()."""
+        mem = InMemoryContext()
+        policy = ApprovalPolicy(blocked_tools=["send_email"])
+
+        @tool
+        async def send_email(to: str) -> str:
+            return f"Sent to {to}"
+
+        @Agent(name="assistant", role="Assistant", tools=[send_email])
+        async def assistant(task: str, context: dict) -> str:
+            return task
+
+        llm = ScriptedLLM([
+            _response("", tool_calls=[_tool_call("c1", "send_email", {"to": "x"})]),
+            _response("done"),
+        ])
+        pipe = Pipeline(llm=llm, memory=mem, approval_policy=policy)
+        pipe.add(assistant)
+
+        paused = await pipe.run("Send mail")
+        assert paused.status == "paused"
+
+        result = await pipe.resume(paused.pause_info["session_id"], "", approved=True)
+        assert result.status == "completed"
+        # The shared agent instance must not have been mutated by resume.
+        assert assistant._session_id == "default"
+
+    async def test_stream_pause_persists_run_id_distinct_from_session(self):
+        """Pause state saved during stream() carries a real run_id, not the session id."""
+        mem = InMemoryContext()
+        policy = ApprovalPolicy(blocked_tools=["send_email"])
+
+        @tool
+        async def send_email(to: str) -> str:
+            return f"Sent to {to}"
+
+        @Agent(name="streamer", role="Assistant", tools=[send_email])
+        async def streamer(task: str, context: dict) -> str:
+            return task
+
+        llm = ScriptedLLM([
+            _response("", tool_calls=[_tool_call("c1", "send_email", {"to": "x"})]),
+        ])
+        pipe = Pipeline(
+            llm=llm, memory=mem, approval_policy=policy, session_id="fixed-session"
+        )
+        pipe.add(streamer)
+
+        events = [e async for e in pipe.stream("Send mail")]
+        assert any(e.type == "pipeline_paused" for e in events)
+
+        ctx = await mem.load_context("fixed-session")
+        state = json.loads(ctx["__hitl_pipeline"])
+        assert state["session_id"] == "fixed-session"
+        assert state["run_id"] != "fixed-session"

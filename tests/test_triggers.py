@@ -10,8 +10,8 @@ from typing import Any
 import pytest
 
 from agentflow import Pipeline, PipelineResult
-from agentflow.triggers import BaseTrigger, MQTTTrigger
 from agentflow.agent import BaseAgent
+from agentflow.triggers import BaseTrigger, MQTTTrigger
 from agentflow.types import AgentResult
 
 # ── Shared test helpers ──────────────────────────────────────────────────────────

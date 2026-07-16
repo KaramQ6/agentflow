@@ -158,3 +158,80 @@ async def test_pipeline_get_result():
     assert agent_result.agent == "alpha"
 
     assert result.get("nonexistent") is None
+
+
+# ── 0.6 regressions ────────────────────────────────────────────────────────────
+
+
+class PausingAgent(BaseAgent):
+    """Raises PauseExecution, simulating an HITL block."""
+
+    def __init__(self, name: str):
+        super().__init__(name=name, role="pauser")
+
+    async def execute(self, task, context, llm):
+        from agentflow import PauseExecution
+
+        raise PauseExecution(
+            agent_name=self.name,
+            tool_name="send_email",
+            tool_arguments="{}",
+            tool_call_id="c1",
+            messages=[],
+            total_tokens=0,
+            total_cost=0.0,
+            model_name="mock",
+            trace=[],
+            pending_calls=[],
+            seen_calls=[],
+            iterations_used=0,
+        )
+
+
+class FailingAgent(BaseAgent):
+    def __init__(self, name: str):
+        super().__init__(name=name, role="failer")
+
+    async def execute(self, task, context, llm):
+        from agentflow.exceptions import AgentError
+
+        raise AgentError(self.name, "boom")
+
+
+@pytest.mark.asyncio
+async def test_error_wins_over_sibling_pause():
+    """A real failure in a level must raise even when a sibling paused."""
+    from agentflow import InMemoryContext
+    from agentflow.exceptions import AgentError
+
+    saves: list[str] = []
+
+    class RecordingMemory(InMemoryContext):
+        async def save_context(self, session_id, key, value):
+            saves.append(key)
+            await super().save_context(session_id, key, value)
+
+    pipe = Pipeline(llm=MockLLM(), memory=RecordingMemory())
+    pipe.add(PausingAgent("pauser"))
+    pipe.add(FailingAgent("failer"))
+
+    with pytest.raises(AgentError, match="boom"):
+        await pipe.run("task")
+
+    # The discarded pause must not have been persisted.
+    assert "__hitl_pipeline" not in saves
+    assert "__hitl_agent" not in saves
+
+
+def test_cycle_error_names_members():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(SimpleAgent("alpha"))
+    pipe.add(SimpleAgent("beta"), depends_on=["alpha"])
+    # Forge a cycle directly — add() forbids forward references.
+    pipe._nodes[0].depends_on = ["beta"]
+
+    with pytest.raises(PipelineError) as exc_info:
+        pipe._resolve_levels()
+
+    assert "alpha" in str(exc_info.value)
+    assert "beta" in str(exc_info.value)

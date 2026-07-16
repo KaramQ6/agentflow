@@ -415,3 +415,49 @@ def test_supervisor_duplicate_worker_names_last_wins():
     sup = SupervisorAgent("mgr", "Manager", workers=[w1, w2])
 
     assert sup._workers["a"] is w2
+
+
+# --------------------------------------------------------------------------- #
+# 0.6 regressions
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stringifies_dict_context():
+    """Context values may be dicts (validated output_schema results)."""
+    sup = SupervisorAgent("mgr", "Manager", workers=[])
+    llm = ScriptedLLM([_response("done")])
+
+    result = await sup.execute("task", {"upstream": {"score": 9}}, llm)
+
+    assert result.output == "done"
+    user_msg = llm.requests[0]["messages"][1]["content"]
+    assert "upstream" in user_msg
+    assert "score" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_supervisor_concurrent_runs_have_isolated_billing():
+    """Two concurrent runs sharing one supervisor must not mix ledgers."""
+    import asyncio
+
+    worker = DummyWorker("worker_a", "Worker", "out", tokens=10, cost=0.01)
+    sup = SupervisorAgent("mgr", "Manager", workers=[worker])
+
+    def scripted() -> ScriptedLLM:
+        return ScriptedLLM([
+            _response("", tool_calls=[
+                _tool_call("c1", "delegate_task", {"worker_name": "worker_a", "sub_task": "s"})
+            ]),
+            _response("final"),
+        ])
+
+    r1, r2 = await asyncio.gather(
+        sup.execute("t1", {}, scripted()),
+        sup.execute("t2", {}, scripted()),
+    )
+
+    assert r1.metadata["accumulated_worker_tokens"] == 10
+    assert r2.metadata["accumulated_worker_tokens"] == 10
+    assert len(r1.metadata["worker_delegations"]) == 1
+    assert len(r2.metadata["worker_delegations"]) == 1

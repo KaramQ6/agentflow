@@ -1,6 +1,8 @@
 """Tests for the LLM provider."""
 
-from agentflow import LLM
+import pytest
+
+from agentflow import LLM, LLMResponse
 
 
 def test_llm_init_defaults():
@@ -29,3 +31,23 @@ def test_llm_init_custom():
 def test_llm_has_client():
     llm = LLM(api_key="test")
     assert llm._client is not None
+
+
+def test_llmresponse_dict_shim_warns():
+    """Dict-style access still works but warns; attribute access is silent."""
+    response = LLMResponse(content="hello", tokens=3)
+
+    with pytest.warns(DeprecationWarning, match="attribute access"):
+        assert response["content"] == "hello"
+    with pytest.warns(DeprecationWarning, match="attribute access"):
+        assert response.get("cost") == 0.0
+    with pytest.warns(DeprecationWarning), pytest.raises(KeyError):
+        response["nonexistent"]
+
+    # Attribute access must not warn.
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", DeprecationWarning)
+        assert response.content == "hello"
+        assert response.tokens == 3
