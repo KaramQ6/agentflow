@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.6.1] — 2026-07-16
+
+Packaging-hygiene release. **0.6.0 has been yanked from PyPI.** Its source
+distribution (`.tar.gz`) accidentally bundled a local, untracked
+`.bridgespace/` agent-workspace directory whose contents included a leaked
+PyPI API token (since revoked by PyPI). The Python package code was
+identical and unaffected; only the sdist contained the stray directory.
+
+### Fixed
+- **Security/packaging**: `.bridgespace/` (a local multi-agent workspace, never
+  part of the library) was not excluded from the build and leaked into the
+  0.6.0 sdist. It is now git-ignored and excluded from all distributions. The
+  wheel was never affected. If you installed 0.6.0, upgrade to 0.6.1.
+
+---
+
 ## [0.6.0] — 2026-07-16
 
 First release shipping a pure-Python `py3-none-any` wheel. The only wheel

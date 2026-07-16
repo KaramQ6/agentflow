@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentflowkit"
-version = "0.6.0"
+version = "0.6.1"
 description = "Lightweight multi-agent AI pipeline framework with parallel DAG execution, tool calling, and cost tracking"
 readme = "README.md"
 license = "MIT"

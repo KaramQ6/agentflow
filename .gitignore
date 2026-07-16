@@ -29,3 +29,5 @@ commit_msg.txt
 # Hackathon demo app — lives in its own repo, not in the library
 nova_bridge/
 run_nova_bridge.py
+# Multi-agent orchestration workspace — untracked local state, never a package file
+.bridgespace/
