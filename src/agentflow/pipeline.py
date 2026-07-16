@@ -157,7 +157,11 @@ class Pipeline:
             levels.append(level)
 
         if sum(len(lvl) for lvl in levels) != len(self._nodes):
-            raise PipelineError("Cycle detected in pipeline dependency graph")
+            cycle_members = sorted(name for name, deg in in_degree.items() if deg > 0)
+            raise PipelineError(
+                "Cycle detected in pipeline dependency graph involving: "
+                + ", ".join(cycle_members)
+            )
 
         return levels
 
@@ -265,6 +269,162 @@ class Pipeline:
         if spent > self._budget_usd:
             raise BudgetExceededError(self._budget_usd, round(spent, 6))
 
+    def _build_result(
+        self,
+        *,
+        last_output: str,
+        results: dict[str, AgentResult],
+        run_id: str,
+        levels_executed: int,
+        wall_start: float,
+        pause: PauseExecution | None = None,
+        session_id: str = "",
+    ) -> PipelineResult:
+        """Build the final PipelineResult (``paused`` when *pause* is given)."""
+        return PipelineResult(
+            output=last_output,
+            results=results,
+            total_tokens=sum(r.tokens_used for r in results.values()),
+            total_cost=round(sum(r.cost for r in results.values()), 6),
+            total_duration=round(sum(r.duration for r in results.values()), 3),
+            wall_time=round(time.perf_counter() - wall_start, 3),
+            run_id=run_id,
+            levels_executed=levels_executed,
+            agents_with_cache_hits=sum(1 for r in results.values() if r.cached),
+            status="paused" if pause is not None else "completed",
+            pause_info=(
+                {
+                    "agent_name": pause.agent_name,
+                    "tool_name": pause.tool_name,
+                    "tool_arguments": pause.tool_arguments,
+                    "session_id": session_id,
+                }
+                if pause is not None
+                else None
+            ),
+        )
+
+    async def _run_levels(
+        self,
+        *,
+        levels: list[list[_PipelineNode]],
+        start_level: int,
+        task: str,
+        context: dict[str, Any],
+        results: dict[str, AgentResult],
+        session_id: str,
+        run_id: str,
+        emitter: EventEmitter | None = None,
+    ) -> tuple[str, PauseExecution | None, int]:
+        """Execute DAG levels sequentially; agents within a level run concurrently.
+
+        The single driver behind :meth:`run`, :meth:`resume`, and
+        :meth:`stream`: condition filtering, dep-scoped context slices,
+        error/pause precedence, result recording, hooks/events, and budget
+        enforcement live only here. *context* and *results* are mutated in
+        place.
+
+        Returns:
+            ``(last_output, pause, levels_executed)`` — *pause* is the
+            PauseExecution that stopped the run (its state already persisted),
+            or None when every level completed. A real agent failure raises
+            instead; an error in a level takes precedence over a sibling
+            pause, because silently losing an exception is worse than losing
+            a pause (the pause can simply trigger again on a re-run).
+        """
+        last_output = ""
+        for level_index in range(start_level, len(levels)):
+            # Filter out agents whose condition is not met
+            to_run: list[_PipelineNode] = []
+            for node in levels[level_index]:
+                if node.condition is not None and not node.condition(context):
+                    if emitter is not None:
+                        emitter.emit("agent_skipped", agent=node.agent.name, level=level_index)
+                    continue
+                to_run.append(node)
+
+            if not to_run:
+                continue
+
+            for node in to_run:
+                if self._hooks is not None:
+                    safe_invoke(self._hooks, "on_agent_start", node.agent.name, level_index)
+                if emitter is not None:
+                    emitter.emit(
+                        "agent_start",
+                        agent=node.agent.name,
+                        role=node.agent.role,
+                        level=level_index,
+                    )
+
+            # Build context scoped to each agent's declared dependencies
+            level_coros = [
+                self._execute_node(
+                    node,
+                    task,
+                    {k: v for k, v in context.items() if k in node.depends_on},
+                    level_index,
+                    session_id,
+                )
+                for node in to_run
+            ]
+
+            level_results = await asyncio.gather(*level_coros, return_exceptions=True)
+
+            first_error: tuple[_PipelineNode, BaseException] | None = None
+            pause: PauseExecution | None = None
+            for node, result in zip(to_run, level_results, strict=False):
+                if isinstance(result, PauseExecution):
+                    if pause is None:
+                        pause = result
+                elif isinstance(result, BaseException) and first_error is None:
+                    first_error = (node, result)
+
+            if first_error is not None:
+                node, error = first_error
+                if pause is not None:
+                    _logger.warning(
+                        "Discarding HITL pause from agent '%s': sibling agent "
+                        "'%s' failed in the same level",
+                        pause.agent_name,
+                        node.agent.name,
+                    )
+                if self._hooks is not None:
+                    err = error if isinstance(error, Exception) else Exception(str(error))
+                    safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
+                if emitter is not None:
+                    emitter.emit("agent_error", agent=node.agent.name, error=str(error))
+                raise error
+
+            if pause is not None:
+                persisted_output = await self._persist_pause_state(
+                    session_id, run_id, task, level_index, pause,
+                    to_run, level_results, results, context,
+                )
+                return persisted_output or last_output, pause, level_index
+
+            for node, result in zip(to_run, level_results, strict=False):
+                assert isinstance(result, AgentResult)
+                results[node.agent.name] = result
+                context[node.agent.name] = result.data if result.data is not None else result.output
+                last_output = result.output
+                if self._hooks is not None:
+                    safe_invoke(self._hooks, "on_agent_end", result)
+                if emitter is not None:
+                    emitter.emit(
+                        "agent_complete",
+                        agent=node.agent.name,
+                        tokens=result.tokens_used,
+                        duration=result.duration,
+                        cached=result.cached,
+                        level=level_index,
+                        output_preview=result.output[:200],
+                    )
+
+            self._check_budget(results)
+
+        return last_output, None, len(levels)
+
     async def run(self, task: str) -> PipelineResult:
         """Execute the pipeline with parallel level execution.
 
@@ -281,94 +441,32 @@ class Pipeline:
         levels = self._resolve_levels()
         results: dict[str, AgentResult] = {}
         context: dict[str, Any] = {}
-        last_output = ""
         run_id = uuid.uuid4().hex[:8]
         session_id = self._session_id or run_id
 
         if self._hooks is not None:
             safe_invoke(self._hooks, "on_pipeline_start", task, run_id, len(self._nodes))
 
-        for level_index, level in enumerate(levels):
-            # Filter out agents whose condition is not met
-            to_run: list[_PipelineNode] = []
-            for node in level:
-                if node.condition is not None and not node.condition(context):
-                    continue
-                to_run.append(node)
-
-            if not to_run:
-                continue
-
-            if self._hooks is not None:
-                for node in to_run:
-                    safe_invoke(self._hooks, "on_agent_start", node.agent.name, level_index)
-
-            # Build context scoped to each agent's declared dependencies
-            level_coros = [
-                self._execute_node(node, task, {k: v for k, v in context.items() if k in node.depends_on}, level_index, session_id)
-                for node in to_run
-            ]
-
-            level_results = await asyncio.gather(*level_coros, return_exceptions=True)
-
-            # ── HITL: check for paused agents first ──────────────────────────
-            for _node, result in zip(to_run, level_results, strict=False):
-                if isinstance(result, PauseExecution):
-                    last_output = await self._persist_pause_state(
-                        session_id, run_id, task, level_index, result,
-                        to_run, level_results, results, context,
-                    )
-                    return PipelineResult(
-                        output=last_output,
-                        results=results,
-                        total_tokens=sum(r.tokens_used for r in results.values()),
-                        total_cost=round(sum(r.cost for r in results.values()), 6),
-                        total_duration=round(sum(r.duration for r in results.values()), 3),
-                        wall_time=round(time.perf_counter() - wall_start, 3),
-                        run_id=run_id,
-                        levels_executed=level_index,
-                        agents_with_cache_hits=sum(1 for r in results.values() if r.cached),
-                        status="paused",
-                        pause_info={
-                            "agent_name": result.agent_name,
-                            "tool_name": result.tool_name,
-                            "tool_arguments": result.tool_arguments,
-                            "session_id": session_id,
-                        },
-                    )
-
-            # ── Other errors: fail the pipeline ──────────────────────────────
-            for node, result in zip(to_run, level_results, strict=False):
-                if isinstance(result, BaseException):
-                    if self._hooks is not None:
-                        err = result if isinstance(result, Exception) else Exception(str(result))
-                        safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
-                    raise result
-                results[node.agent.name] = result
-                context[node.agent.name] = result.data if result.data is not None else result.output
-                last_output = result.output
-                if self._hooks is not None:
-                    safe_invoke(self._hooks, "on_agent_end", result)
-
-            self._check_budget(results)
-
-        total_tokens = sum(r.tokens_used for r in results.values())
-        total_cost = sum(r.cost for r in results.values())
-        total_duration = sum(r.duration for r in results.values())
-        cache_hits = sum(1 for r in results.values() if r.cached)
-
-        pipeline_result = PipelineResult(
-            output=last_output,
+        last_output, pause, levels_executed = await self._run_levels(
+            levels=levels,
+            start_level=0,
+            task=task,
+            context=context,
             results=results,
-            total_tokens=total_tokens,
-            total_cost=round(total_cost, 6),
-            total_duration=round(total_duration, 3),
-            wall_time=round(time.perf_counter() - wall_start, 3),
+            session_id=session_id,
             run_id=run_id,
-            levels_executed=len(levels),
-            agents_with_cache_hits=cache_hits,
         )
-        if self._hooks is not None:
+
+        pipeline_result = self._build_result(
+            last_output=last_output,
+            results=results,
+            run_id=run_id,
+            levels_executed=levels_executed,
+            wall_start=wall_start,
+            pause=pause,
+            session_id=session_id,
+        )
+        if pause is None and self._hooks is not None:
             safe_invoke(self._hooks, "on_pipeline_end", pipeline_result)
         return pipeline_result
 
@@ -428,7 +526,7 @@ class Pipeline:
         results: dict[str, AgentResult] = {}
         for name, data in pipeline_state["results"].items():
             results[name] = AgentResult(**data)
-        last_output = next(reversed(context.values()), "") if context else ""
+        last_output = next(reversed(results.values())).output if results else ""
 
         # Locate the paused agent in the pipeline.
         agent: _DecoratorAgent | None = None
@@ -443,12 +541,15 @@ class Pipeline:
                 "does not support resume_execution"
             )
 
-        if hasattr(agent, 'set_session'):
-            agent.set_session(session_id)
-
-        # Resume the agent.
+        # Resume the agent with run-scoped state — never mutate the shared
+        # instance (concurrent pipeline runs may share it).
         agent_result = await agent.resume_execution(
-            pause_data, self._llm, approved, human_feedback
+            pause_data,
+            self._llm,
+            approved,
+            human_feedback,
+            session_id=session_id,
+            approval_policy=self._approval_policy,
         )
         results[paused_name] = agent_result
         context[paused_name] = (
@@ -456,89 +557,40 @@ class Pipeline:
         )
         last_output = agent_result.output
 
-        # Continue with remaining pipeline levels.
+        # Continue with remaining pipeline levels (supports nested pauses).
         levels = self._resolve_levels()
-        for level_index in range(current_level + 1, len(levels)):
-            level = levels[level_index]
-            to_run: list[_PipelineNode] = []
-            for node in level:
-                if node.condition is not None and not node.condition(context):
-                    continue
-                to_run.append(node)
+        tail_output, pause, levels_executed = await self._run_levels(
+            levels=levels,
+            start_level=current_level + 1,
+            task=task,
+            context=context,
+            results=results,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        last_output = tail_output or last_output
 
-            if not to_run:
-                continue
-
-            level_coros = [
-                self._execute_node(
-                    node,
-                    task,
-                    {k: v for k, v in context.items() if k in node.depends_on},
-                    level_index,
-                    session_id,
-                )
-                for node in to_run
-            ]
-
-            level_results = await asyncio.gather(*level_coros, return_exceptions=True)
-
-            # Support nested pauses during resume.
-            for _node, result in zip(to_run, level_results, strict=False):
-                if isinstance(result, PauseExecution):
-                    last_output = await self._persist_pause_state(
-                        session_id, run_id, task, level_index, result,
-                        to_run, level_results, results, context,
-                    )
-                    return PipelineResult(
-                        output=last_output,
-                        results=results,
-                        total_tokens=sum(r.tokens_used for r in results.values()),
-                        total_cost=round(sum(r.cost for r in results.values()), 6),
-                        total_duration=round(sum(r.duration for r in results.values()), 3),
-                        wall_time=round(time.perf_counter() - wall_start, 3),
-                        run_id=run_id,
-                        levels_executed=level_index,
-                        agents_with_cache_hits=sum(1 for r in results.values() if r.cached),
-                        status="paused",
-                        pause_info={
-                            "agent_name": result.agent_name,
-                            "tool_name": result.tool_name,
-                            "tool_arguments": result.tool_arguments,
-                            "session_id": session_id,
-                        },
-                    )
-
-            for node, result in zip(to_run, level_results, strict=False):
-                if isinstance(result, BaseException):
-                    if self._hooks is not None:
-                        err = result if isinstance(result, Exception) else Exception(str(result))
-                        safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
-                    raise result
-                results[node.agent.name] = result
-                context[node.agent.name] = result.data if result.data is not None else result.output
-                last_output = result.output
-
-            self._check_budget(results)
+        if pause is not None:
+            return self._build_result(
+                last_output=last_output,
+                results=results,
+                run_id=run_id,
+                levels_executed=levels_executed,
+                wall_start=wall_start,
+                pause=pause,
+                session_id=session_id,
+            )
 
         # Clean up HITL keys from memory.
         await self._memory.delete_key(session_id, "__hitl_pipeline")
         await self._memory.delete_key(session_id, "__hitl_agent")
 
-        total_tokens = sum(r.tokens_used for r in results.values())
-        total_cost = sum(r.cost for r in results.values())
-        total_duration = sum(r.duration for r in results.values())
-        cache_hits = sum(1 for r in results.values() if r.cached)
-
-        return PipelineResult(
-            output=last_output,
+        return self._build_result(
+            last_output=last_output,
             results=results,
-            total_tokens=total_tokens,
-            total_cost=round(total_cost, 6),
-            total_duration=round(total_duration, 3),
-            wall_time=round(time.perf_counter() - wall_start, 3),
             run_id=run_id,
             levels_executed=len(levels),
-            agents_with_cache_hits=cache_hits,
+            wall_start=wall_start,
         )
 
     async def stream(self, task: str) -> AsyncGenerator[Event, None]:
@@ -555,81 +607,35 @@ class Pipeline:
         context: dict[str, Any] = {}
 
         async def _run() -> None:
-            session_id = self._session_id or uuid.uuid4().hex[:8]
+            run_id = uuid.uuid4().hex[:8]
+            session_id = self._session_id or run_id
             try:
-                for level_index, level in enumerate(levels):
-                    to_run: list[_PipelineNode] = []
-                    for node in level:
-                        if node.condition is not None and not node.condition(context):
-                            emitter.emit("agent_skipped", agent=node.agent.name, level=level_index)
-                            continue
-                        to_run.append(node)
+                _, pause, _ = await self._run_levels(
+                    levels=levels,
+                    start_level=0,
+                    task=task,
+                    context=context,
+                    results=results,
+                    session_id=session_id,
+                    run_id=run_id,
+                    emitter=emitter,
+                )
 
-                    if not to_run:
-                        continue
+                if pause is not None:
+                    emitter.emit(
+                        "pipeline_paused",
+                        agent=pause.agent_name,
+                        tool_name=pause.tool_name,
+                        tool_arguments=pause.tool_arguments,
+                        session_id=session_id,
+                    )
+                    return
 
-                    # Emit start events for all agents in this level
-                    for node in to_run:
-                        emitter.emit("agent_start", agent=node.agent.name, role=node.agent.role, level=level_index)
-
-                    level_coros = [
-                        self._execute_node(
-                            node,
-                            task,
-                            {k: v for k, v in context.items() if k in node.depends_on},
-                            level_index,
-                            session_id,
-                        )
-                        for node in to_run
-                    ]
-
-                    level_results = await asyncio.gather(*level_coros, return_exceptions=True)
-
-                    # ── HITL: check for paused agents first ──────────────────
-                    for _node, result in zip(to_run, level_results, strict=False):
-                        if isinstance(result, PauseExecution):
-                            await self._persist_pause_state(
-                                session_id, session_id, task, level_index, result,
-                                to_run, level_results, results, context,
-                            )
-                            emitter.emit(
-                                "pipeline_paused",
-                                agent=result.agent_name,
-                                tool_name=result.tool_name,
-                                tool_arguments=result.tool_arguments,
-                                session_id=session_id,
-                            )
-                            emitter.done()
-                            return
-
-                    for node, result in zip(to_run, level_results, strict=False):
-                        if isinstance(result, BaseException):
-                            emitter.emit("agent_error", agent=node.agent.name, error=str(result))
-                            raise result
-                        results[node.agent.name] = result
-                        context[node.agent.name] = (
-                            result.data if result.data is not None else result.output
-                        )
-                        emitter.emit(
-                            "agent_complete",
-                            agent=node.agent.name,
-                            tokens=result.tokens_used,
-                            duration=result.duration,
-                            cached=result.cached,
-                            level=level_index,
-                            output_preview=result.output[:200],
-                        )
-
-                    self._check_budget(results)
-
-                total_tokens = sum(r.tokens_used for r in results.values())
-                total_cost = sum(r.cost for r in results.values())
-                total_duration = sum(r.duration for r in results.values())
                 emitter.emit(
                     "pipeline_complete",
-                    total_tokens=total_tokens,
-                    total_cost=round(total_cost, 6),
-                    total_duration=round(total_duration, 3),
+                    total_tokens=sum(r.tokens_used for r in results.values()),
+                    total_cost=round(sum(r.cost for r in results.values()), 6),
+                    total_duration=round(sum(r.duration for r in results.values()), 3),
                     wall_time=round(time.perf_counter() - wall_start, 3),
                     agents_completed=len(results),
                     levels_executed=len(levels),
@@ -671,6 +677,10 @@ class Pipeline:
         concurrently executing pipeline runs to *max_concurrent*, preventing
         a spike of incoming messages from overwhelming the host.
 
+        When a trigger yields a non-empty ``context_data`` dict, it is
+        appended to the task prompt as a JSON block so the payload reaches
+        the agents.
+
         Args:
             trigger: A :class:`~agentflow.triggers.BaseTrigger` that yields
                      ``(task_prompt, context_data)`` tuples.
@@ -696,6 +706,11 @@ class Pipeline:
         sem = asyncio.Semaphore(max_concurrent)
 
         async def _run_one(task_prompt: str, context_data: dict[str, Any]) -> None:
+            # Trigger payloads travel with the task — otherwise they'd be lost.
+            if context_data:
+                task_prompt = (
+                    f"{task_prompt}\n\nContext data (JSON):\n{json.dumps(context_data)}"
+                )
             async with sem:
                 try:
                     result = await self.run(task_prompt)
