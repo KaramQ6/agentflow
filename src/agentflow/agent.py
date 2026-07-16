@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -22,6 +23,7 @@ DEFAULT_MAX_TOOL_ITERATIONS = 6
 TOOL_OUTPUT_MAX_CHARS = 5000
 MESSAGES_MAX_LENGTH = 20
 LLM_RETRIES_PER_ITERATION = 1
+MEMORY_SNIPPET_MAX_CHARS = 300
 
 _log = logging.getLogger("agentflow.agent")
 
@@ -63,8 +65,12 @@ class BaseAgent(ABC):
         ...
 
 
-class _DecoratorAgent:
-    """Agent created via the @Agent decorator."""
+class AgentSpec:
+    """Agent created via the :class:`Agent` decorator.
+
+    This is the object users hold after decorating a function; ``Pipeline.add``
+    accepts it directly. (Named ``_DecoratorAgent`` before 0.6.)
+    """
 
     def __init__(
         self,
@@ -75,6 +81,7 @@ class _DecoratorAgent:
         tools: list[Tool] | None = None,
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         memory: BaseMemory | None = None,
+        system_prompt: str | None = None,
     ):
         self.name = name
         self.role = role
@@ -83,9 +90,10 @@ class _DecoratorAgent:
         self._tools = tools or []
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
+        self._system_prompt = system_prompt
         self._session_id = "default"
         self._approval_policy: ApprovalPolicy | None = None
-        # B5/B8: Pre-compute tool schemas once at construction time.
+        # Tool schemas are static per agent — compute them once, not per call.
         self._openai_tools = [t.openai_schema for t in self._tools]
 
     def set_session(self, session_id: str) -> None:
@@ -94,6 +102,13 @@ class _DecoratorAgent:
         Deprecated: prefer passing ``session_id`` to :meth:`execute`. Mutating
         a shared agent instance is unsafe under concurrent pipeline runs.
         """
+        warnings.warn(
+            "set_session() is deprecated and will be removed in 1.0; pass "
+            "session_id= to execute() instead — mutating a shared agent "
+            "instance is unsafe under concurrent pipeline runs.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._session_id = session_id
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
@@ -102,6 +117,12 @@ class _DecoratorAgent:
         Deprecated: prefer passing ``approval_policy`` to :meth:`execute` —
         same shared-instance concern as :meth:`set_session`.
         """
+        warnings.warn(
+            "set_approval_policy() is deprecated and will be removed in 1.0; "
+            "pass approval_policy= to execute() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._approval_policy = policy
 
     async def execute(
@@ -123,13 +144,22 @@ class _DecoratorAgent:
         except Exception as e:
             raise AgentError(self.name, f"Prompt function failed: {e}") from e
 
-        system_prompt = f"You are a {self.role}. Provide clear, thorough, well-structured responses."
+        system_prompt = self._system_prompt or (
+            f"You are a {self.role}. Provide clear, thorough, well-structured responses."
+        )
 
-        # M3: Inject prior session context from memory into the system prompt.
+        # Inject prior session context from memory into the system prompt.
         if self._memory is not None:
             prev = await self._memory.load_context(effective_session)
             if prev:
-                parts = [f"{name}: {output[:300]}" for name, output in prev.items()]
+                parts: list[str] = []
+                for name, output in prev.items():
+                    if len(str(output)) > MEMORY_SNIPPET_MAX_CHARS:
+                        _log.debug(
+                            "Memory snippet '%s' truncated to %d chars for agent %s",
+                            name, MEMORY_SNIPPET_MAX_CHARS, self.name,
+                        )
+                    parts.append(f"{name}: {str(output)[:MEMORY_SNIPPET_MAX_CHARS]}")
                 system_prompt += (
                     "\n\n[Memory — previous outputs from this session:\n"
                     + "\n".join(parts)
@@ -200,11 +230,11 @@ class _DecoratorAgent:
         """Drive a ReAct-style loop: call the LLM, run any requested tools, repeat.
 
         Features:
-        - Multiple tool calls run concurrently via ``asyncio.gather`` (B1).
-        - Duplicate tool calls are detected, skipped, and reported as errors (B3).
-        - Tool outputs > 5000 chars are truncated (B4).
-        - Message list is trimmed to prevent context overflow (B2).
-        - Transient LLM errors are retried once per iteration (B7).
+        - Multiple tool calls run concurrently.
+        - Duplicate tool calls are detected, skipped, and reported as errors.
+        - Tool outputs beyond ``TOOL_OUTPUT_MAX_CHARS`` are truncated.
+        - Message list is trimmed to prevent context overflow.
+        - Transient LLM errors are retried once per iteration.
 
         When *start_iteration* > 0 the loop resumes from a prior
         :class:`~agentflow.hitl.PauseExecution`, preserving accumulated tokens,
@@ -221,7 +251,7 @@ class _DecoratorAgent:
         seen_calls: set[tuple[str, str]] = initial_seen_calls or set()
 
         for iteration in range(start_iteration, self._max_tool_iterations):
-            # B7: Per-iteration LLM retry for transient failures.
+            # Per-iteration LLM retry for transient failures.
             for retry in range(LLM_RETRIES_PER_ITERATION + 1):
                 try:
                     response = await llm.generate(messages, tools=self._openai_tools)
@@ -254,7 +284,7 @@ class _DecoratorAgent:
                 }
             )
 
-            # B3: Separate duplicate calls from new ones; duplicates get an
+            # Separate duplicate calls from new ones; duplicates get an
             # immediate error observation without being re-executed.
             results_map: dict[str, tuple[str, str, str, str]] = {}
             coros: list[tuple[str, asyncio.Task[tuple[str, str, str, str]]]] = []
@@ -324,7 +354,7 @@ class _DecoratorAgent:
                     )
                 call_order.append(call["id"])
 
-            # B1: Await all unique tool calls concurrently.
+            # Await all unique tool calls (they were dispatched concurrently).
             if coros:
                 for cid, task in coros:
                     results_map[cid] = await task
@@ -332,14 +362,13 @@ class _DecoratorAgent:
             # Append results in the original tool_calls order.
             for call_id in call_order:
                 _, name, arguments, output = results_map[call_id]
-                # B4: Truncate oversized tool results.
                 output = _truncate_output(output)
                 trace.append({"tool": name, "arguments": arguments, "result": output})
                 messages.append(
                     {"role": "tool", "tool_call_id": call_id, "content": output}
                 )
 
-            # B2: Sliding window — keep system + user, drop oldest tool pairs
+            # Sliding window — keep system + user, drop oldest tool pairs
             # when the message list grows too large.
             if len(messages) > MESSAGES_MAX_LENGTH:
                 overflow = len(messages) - MESSAGES_MAX_LENGTH
@@ -355,7 +384,7 @@ class _DecoratorAgent:
     ) -> tuple[str, str, str, str]:
         """Execute a single tool call and return (call_id, name, arguments, output).
 
-        B6: Execution is logged for observability.
+        Execution is logged for observability.
         """
         fn = call["function"]
         name = fn["name"]
@@ -547,6 +576,10 @@ class Agent:
                When present the agent runs a ReAct loop, letting the model call
                tools and observe results until it produces a final answer.
         max_tool_iterations: Safety cap on tool-calling rounds (default 6).
+        system_prompt: Full replacement for the default system prompt
+                       (``"You are a {role}. Provide clear, thorough,
+                       well-structured responses."``). Memory context, when
+                       configured, is appended to whichever prompt is active.
 
     Usage:
         @Agent(name="researcher", role="Research Analyst")
@@ -581,6 +614,7 @@ class Agent:
         tools: list[Tool] | None = None,
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         memory: BaseMemory | None = None,
+        system_prompt: str | None = None,
     ):
         self.name = name
         self.role = role
@@ -588,9 +622,10 @@ class Agent:
         self._tools = tools
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
+        self._system_prompt = system_prompt
 
-    def __call__(self, fn: Callable[..., Awaitable[str]]) -> _DecoratorAgent:
-        return _DecoratorAgent(
+    def __call__(self, fn: Callable[..., Awaitable[str]]) -> AgentSpec:
+        return AgentSpec(
             self.name,
             self.role,
             fn,
@@ -598,4 +633,13 @@ class Agent:
             tools=self._tools,
             max_tool_iterations=self._max_tool_iterations,
             memory=self._memory,
+            system_prompt=self._system_prompt,
         )
+
+
+# Backwards-compatible aliases. ``_DecoratorAgent`` was the pre-0.6 name of
+# ``AgentSpec``; remove at 1.0.
+_DecoratorAgent = AgentSpec
+
+AgentLike = AgentSpec | BaseAgent
+"""Anything ``Pipeline.add`` accepts: a decorated agent or a BaseAgent subclass."""

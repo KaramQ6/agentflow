@@ -11,14 +11,15 @@ opt-in submodules and are NOT re-exported here:
 See PUBLIC_API.md for the stability contract.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 try:
     __version__ = _pkg_version("agentflowkit")
 except PackageNotFoundError:  # running from a source tree without install
     __version__ = "0.0.0.dev0"
 
-from .agent import Agent, BaseAgent
+from .agent import Agent, AgentSpec, BaseAgent
 from .cache import InMemoryCache, RedisCache, ResponseCache
 from .events import EventEmitter
 from .exceptions import (
@@ -46,6 +47,7 @@ from .types import AgentResult, Event, LLMResponse, PipelineResult
 __all__ = [
     # Core
     "Agent",
+    "AgentSpec",
     "BaseAgent",
     "LLM",
     "Pipeline",

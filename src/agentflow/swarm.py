@@ -11,8 +11,8 @@ from typing import Any
 from .agent import (
     DEFAULT_MAX_TOOL_ITERATIONS,
     MESSAGES_MAX_LENGTH,
+    AgentLike,
     BaseAgent,
-    _DecoratorAgent,
     _truncate_output,
 )
 from .exceptions import AgentError
@@ -21,8 +21,6 @@ from .tools import Tool
 from .types import AgentResult
 
 _log = logging.getLogger("agentflow.swarm")
-
-AgentLike = _DecoratorAgent | BaseAgent
 
 
 class _WorkerLedger:

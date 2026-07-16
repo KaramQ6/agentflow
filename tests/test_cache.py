@@ -115,8 +115,8 @@ async def test_llm_cache_hit_skips_api_call():
     llm._client.chat.completions.create = AsyncMock(side_effect=AssertionError("API was called!"))
 
     result = await llm.generate(messages)
-    assert result["cached"] is True
-    assert result["content"] == "4"
+    assert result.cached is True
+    assert result.content == "4"
 
 
 @pytest.mark.asyncio
@@ -143,10 +143,10 @@ async def test_llm_cache_miss_stores_result():
     llm._client.chat.completions.create = AsyncMock(return_value=mock_response)
 
     result = await llm.generate(messages)
-    assert result["cached"] is False
-    assert result["content"] == "world"
+    assert result.cached is False
+    assert result.content == "world"
 
     # Second call must hit cache
     result2 = await llm.generate(messages)
-    assert result2["cached"] is True
-    assert result2["content"] == "world"
+    assert result2.cached is True
+    assert result2.content == "world"

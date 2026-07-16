@@ -171,9 +171,8 @@ class TestAgentMemoryIntegration:
 
         async def _run():
             agent = test_agent
-            agent.set_session("integration_test")
             llm = ScriptedLLM([_response("processed: hello")])
-            await agent.execute("hello", {}, llm)
+            await agent.execute("hello", {}, llm, session_id="integration_test")
             ctx = await mem.load_context("integration_test")
             assert "test_agent" in ctx
             assert "processed: hello" in ctx["test_agent"]
@@ -207,8 +206,10 @@ class TestAgentMemoryIntegration:
         async def _run():
             a = agent_a
             b = agent_b
-            a.set_session("shared")
-            b.set_session("shared")
+            with pytest.warns(DeprecationWarning):
+                a.set_session("shared")
+            with pytest.warns(DeprecationWarning):
+                b.set_session("shared")
             await a.execute("task", {}, ScriptedLLM([_response("data from A")]))
             await b.execute("task", {}, ScriptedLLM([_response("processed B with context")]))
 

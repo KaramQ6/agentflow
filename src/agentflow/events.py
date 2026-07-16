@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from .types import Event
+from .types import Event, EventType
 
 _logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class EventEmitter:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
-    def emit(self, event_type: str, agent: str = "", **data: Any) -> None:
+    def emit(self, event_type: EventType, agent: str = "", **data: Any) -> None:
         """Emit an event (non-blocking)."""
         event = Event(type=event_type, agent=agent, data=data)
         self._queue.put_nowait(event)

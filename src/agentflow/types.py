@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import uuid
+import warnings
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+EventType = Literal[
+    "agent_start",
+    "agent_complete",
+    "agent_error",
+    "agent_skipped",
+    "pipeline_complete",
+    "pipeline_error",
+    "pipeline_paused",
+]
+"""Every event type the pipeline emits (see :class:`Event`)."""
 
 
 def _utc_now() -> str:
@@ -37,12 +49,24 @@ class LLMResponse(BaseModel):
     finish_reason: str | None = None
 
     def __getitem__(self, key: str) -> Any:
+        warnings.warn(
+            "Dict-style access on LLMResponse is deprecated and will be "
+            "removed in 1.0; use attribute access (response.content) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             return getattr(self, key)
         except AttributeError:
             raise KeyError(key) from None
 
     def get(self, key: str, default: Any = None) -> Any:
+        warnings.warn(
+            "Dict-style access on LLMResponse is deprecated and will be "
+            "removed in 1.0; use attribute access (response.content) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return getattr(self, key, default)
 
 
@@ -86,7 +110,7 @@ class PipelineResult(BaseModel):
     run_id: str = Field(default_factory=_short_uuid)
     levels_executed: int = 0
     agents_with_cache_hits: int = 0
-    status: str = "completed"
+    status: Literal["completed", "paused"] = "completed"
     pause_info: dict[str, Any] | None = None
 
     @property
@@ -102,11 +126,11 @@ class PipelineResult(BaseModel):
 class Event(BaseModel):
     """Pipeline event for streaming.
 
-    Event types: agent_start, agent_complete, agent_error,
-                 agent_skipped, pipeline_complete, pipeline_error.
+    Event types: agent_start, agent_complete, agent_error, agent_skipped,
+    pipeline_complete, pipeline_error, pipeline_paused (see :data:`EventType`).
     """
 
-    type: str
+    type: EventType
     agent: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
     timestamp: str = Field(default_factory=_utc_now)
