@@ -203,13 +203,13 @@ class DynamicSupervisorAgent(BaseAgent):
             except Exception as e:
                 raise AgentError(self.name, str(e)) from e
 
-            total_tokens += response["tokens"]
-            total_cost += response.get("cost", 0.0)
-            model_name = response["model"]
-            tool_calls = response["tool_calls"]
+            total_tokens += response.tokens
+            total_cost += response.cost
+            model_name = response.model
+            tool_calls = response.tool_calls
 
             if not tool_calls:
-                content = response["content"]
+                content = response.content
                 duration = time.perf_counter() - start
                 return AgentResult(
                     agent=self.name,
@@ -230,7 +230,7 @@ class DynamicSupervisorAgent(BaseAgent):
             messages.append(
                 {
                     "role": "assistant",
-                    "content": response["content"] or None,
+                    "content": response.content or None,
                     "tool_calls": tool_calls,
                 }
             )

@@ -25,6 +25,21 @@ _log = logging.getLogger("agentflow.swarm")
 AgentLike = _DecoratorAgent | BaseAgent
 
 
+class _WorkerLedger:
+    """Run-scoped accumulator for delegated-worker tokens, cost, and trace.
+
+    One ledger is created per ``execute()`` call so that concurrent runs
+    sharing a ``SupervisorAgent`` instance never see each other's billing.
+    """
+
+    __slots__ = ("tokens", "cost", "trace")
+
+    def __init__(self) -> None:
+        self.tokens = 0
+        self.cost = 0.0
+        self.trace: list[dict[str, Any]] = []
+
+
 class SupervisorAgent(BaseAgent):
     """An agent that orchestrates a swarm of specialized worker agents.
 
@@ -54,10 +69,6 @@ class SupervisorAgent(BaseAgent):
         self._workers: dict[str, AgentLike] = {w.name: w for w in workers}
         self._max_tool_iterations = max_tool_iterations
 
-        self._accumulated_tokens: int = 0
-        self._accumulated_cost: float = 0.0
-        self._worker_trace: list[dict[str, Any]] = []
-
     async def execute(self, task: str, context: dict[str, Any], llm: LLM) -> AgentResult:
         """Execute the supervisor ReAct loop.
 
@@ -67,14 +78,14 @@ class SupervisorAgent(BaseAgent):
         supervisor's final result.
         """
         start = time.perf_counter()
-        self._accumulated_tokens = 0
-        self._accumulated_cost = 0.0
-        self._worker_trace = []
+        # Run-scoped ledger: concurrent runs sharing this instance must not
+        # see each other's delegation costs.
+        ledger = _WorkerLedger()
 
         supervisor_trace: list[dict[str, Any]] = []
 
         delegate_tool = Tool(
-            self._make_delegate_fn(llm),
+            self._make_delegate_fn(llm, ledger),
             name="delegate_task",
             description=(
                 "Delegate a sub-task to one of the specialized worker agents. "
@@ -86,7 +97,8 @@ class SupervisorAgent(BaseAgent):
         system_prompt = self._build_system_prompt()
         user_message = task
         if context:
-            ctx_parts = [f"{k}: {v[:200]}" for k, v in context.items()]
+            # Context values may be dicts (validated output_schema results).
+            ctx_parts = [f"{k}: {str(v)[:200]}" for k, v in context.items()]
             user_message = (
                 "Context from upstream:\n" + "\n".join(ctx_parts) + f"\n\nTask:\n{task}"
             )
@@ -108,33 +120,33 @@ class SupervisorAgent(BaseAgent):
             except Exception as e:
                 raise AgentError(self.name, str(e)) from e
 
-            total_tokens += response["tokens"]
-            total_cost += response.get("cost", 0.0)
-            model_name = response["model"]
-            tool_calls = response["tool_calls"]
+            total_tokens += response.tokens
+            total_cost += response.cost
+            model_name = response.model
+            tool_calls = response.tool_calls
 
             if not tool_calls:
-                content = response["content"]
+                content = response.content
                 duration = time.perf_counter() - start
                 return AgentResult(
                     agent=self.name,
                     output=content,
-                    tokens_used=total_tokens + self._accumulated_tokens,
-                    cost=round(total_cost + self._accumulated_cost, 6),
+                    tokens_used=total_tokens + ledger.tokens,
+                    cost=round(total_cost + ledger.cost, 6),
                     duration=round(duration, 3),
                     metadata={
                         "model": model_name,
                         "tool_calls": supervisor_trace,
-                        "worker_delegations": self._worker_trace,
-                        "accumulated_worker_tokens": self._accumulated_tokens,
-                        "accumulated_worker_cost": round(self._accumulated_cost, 6),
+                        "worker_delegations": ledger.trace,
+                        "accumulated_worker_tokens": ledger.tokens,
+                        "accumulated_worker_cost": round(ledger.cost, 6),
                     },
                 )
 
             messages.append(
                 {
                     "role": "assistant",
-                    "content": response["content"] or None,
+                    "content": response.content or None,
                     "tool_calls": tool_calls,
                 }
             )
@@ -181,8 +193,11 @@ class SupervisorAgent(BaseAgent):
             f"exceeded max_tool_iterations={self._max_tool_iterations} without a final answer",
         )
 
-    def _make_delegate_fn(self, llm: LLM) -> Callable[..., Any]:
-        """Create the ``delegate_task`` tool function, capturing ``self`` and ``llm``."""
+    def _make_delegate_fn(self, llm: LLM, ledger: _WorkerLedger) -> Callable[..., Any]:
+        """Create the ``delegate_task`` tool function for one run.
+
+        Worker usage is recorded on *ledger* (run-scoped), never on ``self``.
+        """
 
         supervisor_name = self.name
 
@@ -205,9 +220,9 @@ class SupervisorAgent(BaseAgent):
                 result = await worker.execute(sub_task, {}, llm)
             except Exception as e:
                 return f"Error: Worker '{worker_name}' failed — {e}"
-            self._accumulated_tokens += result.tokens_used
-            self._accumulated_cost += result.cost
-            self._worker_trace.append(
+            ledger.tokens += result.tokens_used
+            ledger.cost += result.cost
+            ledger.trace.append(
                 {
                     "worker": worker_name,
                     "sub_task": sub_task,
