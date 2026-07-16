@@ -141,7 +141,7 @@ class ContextDistiller:
                 {"role": "user", "content": raw},
             ]
             response = await self._llm.generate(messages)
-            distilled = response["content"]
+            distilled = response.content
 
             # Atomically write back only if unchanged.
             replaced = await self._memory._replace_distilled(

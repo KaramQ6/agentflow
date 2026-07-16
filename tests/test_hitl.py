@@ -10,6 +10,7 @@ from agentflow import (
     Agent,
     ApprovalPolicy,
     InMemoryContext,
+    LLMResponse,
     PauseExecution,
     Pipeline,
     tool,
@@ -27,18 +28,18 @@ def _tool_call(call_id: str, name: str, arguments: dict) -> dict:
     }
 
 
-def _response(content: str, tool_calls=None, tokens: int = 10) -> dict:
-    return {
-        "content": content,
-        "tokens": tokens,
-        "prompt_tokens": 6,
-        "completion_tokens": 4,
-        "duration": 0.0,
-        "model": "fake-model",
-        "cached": False,
-        "tool_calls": tool_calls,
-        "finish_reason": "tool_calls" if tool_calls else "stop",
-    }
+def _response(content: str, tool_calls=None, tokens: int = 10) -> LLMResponse:
+    return LLMResponse(
+        content=content,
+        tokens=tokens,
+        prompt_tokens=6,
+        completion_tokens=4,
+        duration=0.0,
+        model="fake-model",
+        cached=False,
+        tool_calls=tool_calls,
+        finish_reason="tool_calls" if tool_calls else "stop",
+    )
 
 
 class ScriptedLLM:

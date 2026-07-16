@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from agentflow import Agent, AgentResult, BaseAgent
+from agentflow import Agent, AgentResult, BaseAgent, LLMResponse
 from agentflow.exceptions import AgentError
 from agentflow.llm import LLM
 from agentflow.swarm_routing import MAX_DELEGATION_DEPTH, DynamicSupervisorAgent
@@ -22,18 +22,18 @@ def _tool_call(call_id: str, name: str, arguments: dict) -> dict:
     }
 
 
-def _response(content: str, tool_calls: list | None = None) -> dict:
-    return {
-        "content": content,
-        "tokens": 10,
-        "prompt_tokens": 6,
-        "completion_tokens": 4,
-        "duration": 0.0,
-        "model": "fake-model",
-        "cached": False,
-        "tool_calls": tool_calls or [],
-        "finish_reason": "tool_calls" if tool_calls else "stop",
-    }
+def _response(content: str, tool_calls: list | None = None) -> LLMResponse:
+    return LLMResponse(
+        content=content,
+        tokens=10,
+        prompt_tokens=6,
+        completion_tokens=4,
+        duration=0.0,
+        model="fake-model",
+        cached=False,
+        tool_calls=tool_calls or [],
+        finish_reason="tool_calls" if tool_calls else "stop",
+    )
 
 
 class ScriptedLLM:

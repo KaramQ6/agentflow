@@ -154,11 +154,11 @@ class _DecoratorAgent:
                 response = await llm.generate(messages)
             except Exception as e:
                 raise AgentError(self.name, str(e)) from e
-            content = response["content"]
-            tokens_used = response["tokens"]
-            cost = response.get("cost", 0.0)
-            model_name = response["model"]
-            cached = response.get("cached", False)
+            content = response.content
+            tokens_used = response.tokens
+            cost = response.cost
+            model_name = response.model
+            cached = response.cached
             metadata["model"] = model_name
 
         # M3: Persist this agent's output back to memory for downstream agents.
@@ -238,18 +238,18 @@ class _DecoratorAgent:
                     )
                     await asyncio.sleep(0.5 * (2 ** retry))
 
-            total_tokens += response["tokens"]
-            total_cost += response.get("cost", 0.0)
-            model_name = response["model"]
-            tool_calls = response["tool_calls"]
+            total_tokens += response.tokens
+            total_cost += response.cost
+            model_name = response.model
+            tool_calls = response.tool_calls
 
             if not tool_calls:
-                return response["content"], total_tokens, total_cost, model_name, trace
+                return response.content, total_tokens, total_cost, model_name, trace
 
             messages.append(
                 {
                     "role": "assistant",
-                    "content": response["content"] or None,
+                    "content": response.content or None,
                     "tool_calls": tool_calls,
                 }
             )
@@ -390,6 +390,9 @@ class _DecoratorAgent:
         llm: LLM,
         approved: bool,
         human_feedback: str = "",
+        *,
+        session_id: str | None = None,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> AgentResult:
         """Resume execution after a :class:`~agentflow.hitl.PauseExecution`.
 
@@ -404,10 +407,20 @@ class _DecoratorAgent:
                       *human_feedback* as an error observation instead.
             human_feedback: Contextual message injected when *approved* is
                             ``False`` so the agent can self-correct.
+            session_id: Run-scoped session for memory operations. Falls back to
+                        the instance default when omitted.
+            approval_policy: Run-scoped HITL policy for the continued loop.
+                             Falls back to the instance default when omitted.
 
         Returns:
-            An ``AgentResult`` with the final agent output.
+            An ``AgentResult`` with the final agent output (including
+            ``data`` when an ``output_schema`` is declared, so downstream
+            agents see the same context contract as the normal path).
         """
+        # Run-scoped state: never mutate the (potentially shared) agent
+        # instance for per-run values — concurrent pipelines share it.
+        effective_session = session_id if session_id is not None else self._session_id
+        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
         start = time.perf_counter()
         tool_map = {t.name: t for t in self._tools}
         messages: list[dict[str, Any]] = pause_data["messages"]
@@ -478,7 +491,7 @@ class _DecoratorAgent:
             initial_total_cost=pause_data["total_cost"],
             initial_trace=pause_data["trace"],
             initial_seen_calls=seen_calls,
-            approval_policy=self._approval_policy,
+            approval_policy=effective_policy,
         )
 
         # _run_tool_loop was seeded with the pre-pause totals, so its return
@@ -487,13 +500,20 @@ class _DecoratorAgent:
         total_cost = cost
 
         if self._memory is not None and content:
-            await self._memory.save_context(self._session_id, self.name, content)
+            await self._memory.save_context(effective_session, self.name, content)
 
+        metadata: dict[str, Any] = {
+            "model": model_name,
+            "tool_calls": final_trace,
+        }
+        data: dict[str, Any] | None = None
         if self._output_schema is not None:
             try:
-                self._output_schema.model_validate_json(content)
+                validated = self._output_schema.model_validate_json(content)
             except Exception as e:
                 raise AgentOutputValidationError(self.name, str(e)) from e
+            data = validated.model_dump()
+            metadata["validated_output"] = data
 
         duration = time.perf_counter() - start
         return AgentResult(
@@ -503,10 +523,8 @@ class _DecoratorAgent:
             cost=round(total_cost, 6),
             duration=round(duration, 3),
             cached=False,
-            metadata={
-                "model": model_name,
-                "tool_calls": final_trace,
-            },
+            metadata=metadata,
+            data=data,
         )
 
     def __repr__(self) -> str:

@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from agentflow import Agent
+from agentflow import Agent, LLMResponse
 from agentflow.exceptions import ToolError
 from agentflow.sandbox import (
     _DOCKER_AVAILABLE,
@@ -70,18 +70,18 @@ def _tool_call(call_id: str, name: str, arguments: dict) -> dict:
     }
 
 
-def _response(content: str, tool_calls=None) -> dict:
-    return {
-        "content": content,
-        "tokens": 10,
-        "prompt_tokens": 6,
-        "completion_tokens": 4,
-        "duration": 0.0,
-        "model": "fake-model",
-        "cached": False,
-        "tool_calls": tool_calls,
-        "finish_reason": "tool_calls" if tool_calls else "stop",
-    }
+def _response(content: str, tool_calls=None) -> LLMResponse:
+    return LLMResponse(
+        content=content,
+        tokens=10,
+        prompt_tokens=6,
+        completion_tokens=4,
+        duration=0.0,
+        model="fake-model",
+        cached=False,
+        tool_calls=tool_calls,
+        finish_reason="tool_calls" if tool_calls else "stop",
+    )
 
 
 class ScriptedLLM:
