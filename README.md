@@ -33,6 +33,53 @@ pip install agentflowkit
 pip install "agentflowkit[redis]"
 ```
 
+## The showcase — earnings-call triage
+
+One run of [`examples/earnings_triage.py`](examples/earnings_triage.py): a
+six-agent diamond DAG where a tool-calling fetcher feeds **three analysts
+running in parallel**, a risk synthesizer enforces a **typed Pydantic schema**,
+and the whole run sits under a **hard USD budget**. Works against any
+OpenAI-compatible endpoint — zero API keys with Ollama, free tier on Groq.
+
+```python
+pipe = Pipeline(llm=llm, budget_usd=0.25)      # hard cost ceiling per run
+pipe.add(transcript_fetcher)                   # ReAct tools: transcript + consensus
+pipe.add(financials_analyst, depends_on=["transcript_fetcher"])  # ┐
+pipe.add(sentiment_analyst,  depends_on=["transcript_fetcher"])  # ├ run in parallel
+pipe.add(competitor_scanner, depends_on=["transcript_fetcher"])  # ┘
+pipe.add(risk_synthesizer,   depends_on=["financials_analyst",   # output_schema=
+                                         "sentiment_analyst",    #   RiskAssessment
+                                         "competitor_scanner"])
+pipe.add(brief_writer,       depends_on=["risk_synthesizer"])    # gets the validated dict
+```
+
+Representative output (`python examples/earnings_triage.py` with `gpt-4o-mini`):
+
+```text
+━━━ Run 1 — cold (real LLM calls) ━━━
+  ▶ transcript_fetcher  (level 0)
+  ✓ transcript_fetcher  1289 tok
+  ▶ financials_analyst  (level 1)
+  ▶ sentiment_analyst   (level 1)
+  ▶ competitor_scanner  (level 1)
+  ✓ sentiment_analyst   601 tok
+  ✓ financials_analyst  644 tok
+  ✓ competitor_scanner  589 tok
+  ▶ risk_synthesizer    (level 2)
+  ✓ risk_synthesizer    512 tok
+  ▶ brief_writer        (level 3)
+  ✓ brief_writer        418 tok
+
+  wall time: 11.4s  (agent time summed: 27.9s — parallelism won 16.5s back)
+  total cost: $0.001210
+
+━━━ Run 2 — warm (response cache) ━━━
+  ✓ ... [cache hit] ×6
+
+  wall time: 0.1s
+  total cost: $0.000000        ← cache hits bill $0
+```
+
 ## Architecture
 
 Independent agents at the same DAG level execute **concurrently**. Dependent agents wait for their prerequisite level to complete before starting.
@@ -256,7 +303,9 @@ class Report(BaseModel):
 async def analyst(task: str, context: dict) -> str:
     return f"Analyze and respond as JSON matching: {Report.model_json_schema()}\nTask: {task}"
 
-# result.get("analyst").metadata["validated_output"] → Report dict
+# The validated output flows downstream: agents depending on "analyst"
+# receive the validated dict in context["analyst"], and it's also on
+# result.get("analyst").data
 ```
 
 ### Rate Limiting
@@ -316,6 +365,11 @@ What that buys you:
   parallelism is `asyncio.gather()` on DAG levels, not threads or callbacks.
 - **A short learning curve.** Two decorators (`@Agent`, `@tool`) and a
   `Pipeline` are the whole public surface for most programs.
+- **The boilerplate you were going to write anyway.** Against the honest
+  baseline — hand-rolling `asyncio.gather()` — agentflow is the ~2,000 lines
+  of retries with `Retry-After`, cost tables, budgets, caching, timeouts, and
+  event plumbing you'd otherwise write under deadline, already typed and
+  covered by ~250 tests.
 
 What agentflow deliberately does **not** do — reach for LangChain, CrewAI, or
 similar frameworks if you need these:
@@ -351,9 +405,9 @@ class DatabaseAgent(BaseAgent):
         ])
         return AgentResult(
             agent=self.name,
-            output=response["content"],
-            tokens_used=response["tokens"],
-            duration=response["duration"],
+            output=response.content,
+            tokens_used=response.tokens,
+            duration=response.duration,
         )
 ```
 
@@ -379,6 +433,7 @@ llm = LLM(model="meta-llama/Llama-3-70b-chat-hf",
 
 ## Examples
 
+- [`examples/earnings_triage.py`](examples/earnings_triage.py) — **the showcase**: 6-agent diamond DAG with tools, parallel analysts, typed output, budget, and cache
 - [`examples/tool_agent.py`](examples/tool_agent.py) — a ReAct agent that calls tools (calculator + stock lookup)
 - [`examples/streaming_and_cost.py`](examples/streaming_and_cost.py) — token streaming + USD cost tracking
 - [`examples/research_crew.py`](examples/research_crew.py) — 3-agent sequential research pipeline

@@ -11,7 +11,7 @@ in `agentflow.__all__`:
 
 | Area | Names |
 |---|---|
-| Core | `Agent`, `BaseAgent`, `LLM`, `Pipeline`, `SupervisorAgent` |
+| Core | `Agent`, `AgentSpec`, `BaseAgent`, `LLM`, `Pipeline`, `SupervisorAgent` |
 | Tools | `Tool`, `tool` |
 | Cost | `estimate_cost`, `register_price` |
 | Data models | `AgentResult`, `PipelineResult`, `LLMResponse`, `Event`, `EventEmitter` |
@@ -26,9 +26,15 @@ Covered semantics (not just names):
 - `Pipeline.add/run/resume/stream` signatures and event types.
 - The context contract: each agent receives only its declared dependencies;
   values are `str`, or `dict` when the upstream agent declared an
-  `output_schema` (its validated output).
+  `output_schema` (its validated output). This holds on the resume path too.
 - `LLMResponse` attribute names, and cost/token accounting fields on
   `AgentResult` / `PipelineResult`.
+- The `EventType` Literal values (`agent_start`, `agent_complete`,
+  `agent_error`, `agent_skipped`, `pipeline_complete`, `pipeline_error`,
+  `pipeline_paused`) and `PipelineResult.status`
+  (`"completed"` / `"paused"`).
+- Error precedence within a DAG level: a real agent failure raises even when
+  a sibling paused for HITL approval (the pause is not persisted).
 
 ## Opt-in modules (best-effort, NOT covered by semver)
 
@@ -42,11 +48,14 @@ Importable by full path, excluded from the stability contract:
 
 ## Current deprecations
 
+Deprecated names emit `DeprecationWarning` as of 0.6.
+
 | Deprecated | Use instead | Removal |
 |---|---|---|
 | Dict-style access on `LLMResponse` (`response["content"]`) | Attribute access (`response.content`) | 1.0 |
 | `PipelineResult.total_duration` | `agent_seconds` (summed agent time) or `wall_time` (elapsed) | 1.0 |
 | `set_session` / `set_approval_policy` on agents | `execute(..., session_id=, approval_policy=)` — mutating shared instances is unsafe under concurrency | 1.0 |
+| The `_DecoratorAgent` name | `AgentSpec` (same class; renamed in 0.6) | 1.0 |
 | Top-level imports of sandbox/trigger names | Full-path imports (`agentflow.sandbox`, `agentflow.triggers`) | done in 0.6 |
 
 ## Deprecation policy
