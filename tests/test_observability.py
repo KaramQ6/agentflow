@@ -1,6 +1,7 @@
 """Tests for observability hooks wired into Pipeline.run()."""
 
 import pytest
+
 from agentflow import AgentResult, Hooks, Pipeline
 from agentflow.agent import BaseAgent
 

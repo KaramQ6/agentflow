@@ -330,7 +330,7 @@ class TestSandboxedTool:
 
     @pytest.mark.asyncio
     async def test_python_execution(self):
-        @sandboxed_tool
+        @sandboxed_tool(sandbox=SubprocessSandbox())
         async def run_python(code: str) -> str:
             """Run Python."""
 
@@ -339,7 +339,7 @@ class TestSandboxedTool:
 
     @pytest.mark.asyncio
     async def test_python_execution_error_propagates(self):
-        @sandboxed_tool
+        @sandboxed_tool(sandbox=SubprocessSandbox())
         async def run_python(code: str) -> str:
             """Run Python."""
 
@@ -351,7 +351,7 @@ class TestSandboxedTool:
         if not _GPP_WORKS:
             pytest.skip("working g++ not available")
 
-        @sandboxed_tool(language="cpp")
+        @sandboxed_tool(sandbox=SubprocessSandbox(), language="cpp")
         async def run_cpp(code: str) -> str:
             """Run C++."""
 
@@ -361,7 +361,7 @@ class TestSandboxedTool:
 
     @pytest.mark.asyncio
     async def test_json_string_arguments(self):
-        @sandboxed_tool
+        @sandboxed_tool(sandbox=SubprocessSandbox())
         async def run_python(code: str) -> str:
             """Run Python."""
 
@@ -370,7 +370,7 @@ class TestSandboxedTool:
 
     @pytest.mark.asyncio
     async def test_code_param_extracted_by_position(self):
-        @sandboxed_tool
+        @sandboxed_tool(sandbox=SubprocessSandbox())
         async def execute(source_code: str) -> str:
             """Execute source."""
 
@@ -381,7 +381,7 @@ class TestSandboxedTool:
     async def test_integration_with_agent(self):
         """Simulate an LLM calling the sandboxed tool through an Agent."""
 
-        @sandboxed_tool
+        @sandboxed_tool(sandbox=SubprocessSandbox())
         async def run_python(code: str) -> str:
             """Execute Python code in a secure sandbox."""
 
@@ -429,32 +429,32 @@ class TestCreateSandbox:
 class TestExecuteCode:
     @pytest.mark.asyncio
     async def test_simple_python(self):
-        result = await execute_code("python", "print('hello')")
+        result = await execute_code("python", "print('hello')", sandbox=SubprocessSandbox())
         assert result["exit_code"] == 0
         assert "hello" in result["stdout"]
 
     @pytest.mark.asyncio
     async def test_python_with_error(self):
-        result = await execute_code("python", "raise ValueError('bad')")
+        result = await execute_code("python", "raise ValueError('bad')", sandbox=SubprocessSandbox())
         assert result["exit_code"] != 0
 
     @pytest.mark.asyncio
     async def test_timeout(self):
         code = "import time; time.sleep(30)"
         with pytest.raises(SandboxTimeoutError):
-            await execute_code("python", code, timeout=1)
+            await execute_code("python", code, timeout=1, sandbox=SubprocessSandbox())
 
     @pytest.mark.asyncio
     async def test_unsupported_language(self):
         with pytest.raises(SandboxError, match="Unsupported language"):
-            await execute_code("javascript", "console.log(1)")
+            await execute_code("javascript", "console.log(1)", sandbox=SubprocessSandbox())
 
     @pytest.mark.asyncio
     async def test_cpp(self):
         if not _GPP_WORKS:
             pytest.skip("working g++ not available")
         code = '#include <iostream>\nint main() { std::cout << "ok"; return 0; }'
-        result = await execute_code("cpp", code)
+        result = await execute_code("cpp", code, sandbox=SubprocessSandbox())
         assert result["exit_code"] == 0
         assert "ok" in result["stdout"]
 

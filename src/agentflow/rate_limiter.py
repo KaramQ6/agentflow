@@ -47,36 +47,30 @@ class RateLimiter:
         self._semaphore.release()
 
     async def _wait_for_window(self) -> None:
-        """Block until we are below the RPM limit.
+        """Block until we are below the RPM limit, then record the request.
 
-        Computes sleep duration under the lock, then releases the lock
-        during the actual ``asyncio.sleep`` so other callers can make
-        progress.  After sleeping the lock is re-acquired and the
-        window is re-validated.
+        The check-and-record happens atomically under the lock; the lock is
+        released during ``asyncio.sleep`` so other callers can make progress.
+        Looping (rather than sleeping once) prevents a burst of waiters that
+        woke together from all admitting themselves past the limit.
         """
-        sleep_for: float = 0.0
-        async with self._lock:
-            now = time.monotonic()
-            window_start = now - 60.0
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                window_start = now - 60.0
 
-            # Drop requests older than the 60s window
-            while self._request_times and self._request_times[0] < window_start:
-                self._request_times.popleft()
+                # Drop requests older than the 60s window
+                while self._request_times and self._request_times[0] < window_start:
+                    self._request_times.popleft()
 
-            if len(self._request_times) >= self._rpm:
-                # Calculate remaining time until the oldest request expires
+                if len(self._request_times) < self._rpm:
+                    self._request_times.append(now)
+                    return
+
+                # Remaining time until the oldest request leaves the window
                 sleep_for = 60.0 - (now - self._request_times[0]) + 0.01
 
-        if sleep_for > 0:
             await asyncio.sleep(sleep_for)
-
-        # Re-acquire lock to update the request-times deque
-        async with self._lock:
-            now = time.monotonic()
-            window_start = now - 60.0
-            while self._request_times and self._request_times[0] < window_start:
-                self._request_times.popleft()
-            self._request_times.append(time.monotonic())
 
     async def __aenter__(self) -> RateLimiter:
         await self.acquire()

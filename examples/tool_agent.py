@@ -8,7 +8,9 @@ Run: python examples/tool_agent.py
 Requires GROQ_API_KEY (free at console.groq.com) or edit the api_key below.
 """
 
+import ast
 import asyncio
+import operator
 import os
 
 from agentflow import LLM, Agent, Pipeline, tool
@@ -19,13 +21,38 @@ llm = LLM(
     api_key=os.environ.get("GROQ_API_KEY", ""),
 )
 
+# Arithmetic-only expression evaluator: parse to an AST and walk it, allowing
+# nothing but numbers and these operators. Unlike eval(), there is no code path
+# to names, attributes, or calls.
+_OPERATORS: dict[type[ast.AST], object] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _eval_arithmetic(node: ast.expr) -> float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
+        op = _OPERATORS[type(node.op)]
+        return op(_eval_arithmetic(node.left), _eval_arithmetic(node.right))  # type: ignore[operator]
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPERATORS:
+        op = _OPERATORS[type(node.op)]
+        return op(_eval_arithmetic(node.operand))  # type: ignore[operator]
+    raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+
 
 # --- Tools: plain Python functions. Schemas are generated from the hints. --- #
 @tool
 def calculator(expression: str) -> float:
     """Evaluate a basic arithmetic expression, e.g. '3 * (4 + 5)'."""
-    # Restrict eval to arithmetic only — no names, no builtins.
-    return eval(expression, {"__builtins__": {}}, {})  # noqa: S307 - demo only
+    return _eval_arithmetic(ast.parse(expression, mode="eval").body)
 
 
 @tool

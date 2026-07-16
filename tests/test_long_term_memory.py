@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
 from agentflow.memory import BaseMemory, InMemoryContext, RedisContext, VectorContext
 
 # ── Mock module helpers ──────────────────────────────────────────────────────

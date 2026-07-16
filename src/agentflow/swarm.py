@@ -58,7 +58,7 @@ class SupervisorAgent(BaseAgent):
         self._accumulated_cost: float = 0.0
         self._worker_trace: list[dict[str, Any]] = []
 
-    async def execute(self, task: str, context: dict[str, str], llm: LLM) -> AgentResult:
+    async def execute(self, task: str, context: dict[str, Any], llm: LLM) -> AgentResult:
         """Execute the supervisor ReAct loop.
 
         Builds a dynamic system prompt listing available workers, generates

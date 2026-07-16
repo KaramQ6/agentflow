@@ -21,16 +21,17 @@ Run: python examples/cpp_build_pipeline.py "Write a C++ function that checks if 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import platform
-import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from agentflow import LLM, Agent, Pipeline, tool
-
 
 # ─── Tools ─────────────────────────────────────────────────────────────────────
 
@@ -84,11 +85,14 @@ def compile_and_run(compiler_args: str = "") -> str:
     exe_path = _SOURCE_PATH.with_suffix(".exe" if platform.system() == "Windows" else "")
 
     # Compile
-    extra_args = shlex_split(compiler_args)
+    extra_args = shlex.split(compiler_args)
     compile_cmd = [compiler, "-std=c++17", "-o", str(exe_path), str(_SOURCE_PATH)] + extra_args
-    compile_result = subprocess.run(
-        compile_cmd, capture_output=True, text=True, timeout=30,
-    )
+    try:
+        compile_result = subprocess.run(
+            compile_cmd, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "COMPILATION FAILED: compiler timed out after 30 seconds."
 
     if compile_result.returncode != 0:
         return (
@@ -101,14 +105,12 @@ def compile_and_run(compiler_args: str = "") -> str:
         run_result = subprocess.run(
             [str(exe_path)], capture_output=True, text=True, timeout=10,
         )
-    except subprocess.TimeoutError:
+    except subprocess.TimeoutExpired:
         return "RUNTIME ERROR: program execution timed out after 10 seconds."
     finally:
-        # Cleanup binary
-        try:
+        # Cleanup binary; the OS may still hold a lock on it on Windows.
+        with contextlib.suppress(OSError):
             exe_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     return (
         f"COMPILATION OK (command: {' '.join(compile_cmd)})\n"
@@ -124,28 +126,9 @@ def _find_compiler() -> str | None:
     """Locate a C++ compiler available on PATH."""
     candidates = ["g++", "clang++", "c++", "cl"]
     for name in candidates:
-        if shutil_which(name):
+        if shutil.which(name):
             return name
     return None
-
-
-def shutil_which(cmd: str) -> str | None:
-    """Simple which() without importing shutil (to keep tool modules lean)."""
-    path_ext = os.environ.get("PATHEXT", "").split(os.pathsep)
-    for dirname in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = os.path.join(dirname, cmd)
-        if os.path.isfile(candidate):
-            return candidate
-        for ext in path_ext:
-            full = candidate + ext
-            if os.path.isfile(full):
-                return full
-    return None
-
-
-def shlex_split(s: str) -> list[str]:
-    """Parse a shell-like string into arguments (no shlex dependency)."""
-    return re.findall(r'(?:[^\s"']+|"[^"]*"|\'[^\']*\')', s)
 
 
 # ─── Agent A: C++ Writer ───────────────────────────────────────────────────────

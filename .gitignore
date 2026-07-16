@@ -8,6 +8,9 @@ build/
 venv/
 .env
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
 *.egg
 # AI assistants / agents
 .claude/
@@ -19,3 +22,10 @@ CLAUDE.md
 AGENTS.md
 chat.md
 tmpclaude-*
+# Session/report scaffolding — should never be committed
+*_REPORT.md
+PASS[0-9]*_*.md
+commit_msg.txt
+# Hackathon demo app — lives in its own repo, not in the library
+nova_bridge/
+run_nova_bridge.py

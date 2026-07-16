@@ -47,12 +47,14 @@ class BaseAgent(ABC):
         self.role = role
 
     @abstractmethod
-    async def execute(self, task: str, context: dict[str, str], llm: LLM) -> AgentResult:
+    async def execute(self, task: str, context: dict[str, Any], llm: LLM) -> AgentResult:
         """Execute the agent's task.
 
         Args:
             task: The task/topic string.
             context: Dict mapping agent_name -> output from previous agents.
+                     Values are strings, or dicts when the upstream agent
+                     declared an ``output_schema`` (its validated output).
             llm: The LLM provider to use.
 
         Returns:
@@ -87,14 +89,34 @@ class _DecoratorAgent:
         self._openai_tools = [t.openai_schema for t in self._tools]
 
     def set_session(self, session_id: str) -> None:
-        """Set the session ID used for memory load/save operations."""
+        """Set the default session ID used for memory load/save operations.
+
+        Deprecated: prefer passing ``session_id`` to :meth:`execute`. Mutating
+        a shared agent instance is unsafe under concurrent pipeline runs.
+        """
         self._session_id = session_id
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
-        """Attach an HITL approval policy that intercepts tool calls before execution."""
+        """Attach a default HITL approval policy.
+
+        Deprecated: prefer passing ``approval_policy`` to :meth:`execute` —
+        same shared-instance concern as :meth:`set_session`.
+        """
         self._approval_policy = policy
 
-    async def execute(self, task: str, context: dict[str, str], llm: LLM) -> AgentResult:
+    async def execute(
+        self,
+        task: str,
+        context: dict[str, Any],
+        llm: LLM,
+        *,
+        session_id: str | None = None,
+        approval_policy: ApprovalPolicy | None = None,
+    ) -> AgentResult:
+        # Run-scoped state: never mutate the (potentially shared) agent
+        # instance for per-run values — concurrent pipelines share it.
+        effective_session = session_id if session_id is not None else self._session_id
+        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
         start = time.perf_counter()
         try:
             user_message = await self._prompt_fn(task, context)
@@ -105,7 +127,7 @@ class _DecoratorAgent:
 
         # M3: Inject prior session context from memory into the system prompt.
         if self._memory is not None:
-            prev = await self._memory.load_context(self._session_id)
+            prev = await self._memory.load_context(effective_session)
             if prev:
                 parts = [f"{name}: {output[:300]}" for name, output in prev.items()]
                 system_prompt += (
@@ -121,7 +143,9 @@ class _DecoratorAgent:
 
         metadata: dict[str, Any] = {}
         if self._tools:
-            content, tokens_used, cost, model_name, trace = await self._run_tool_loop(messages, llm)
+            content, tokens_used, cost, model_name, trace = await self._run_tool_loop(
+                messages, llm, approval_policy=effective_policy
+            )
             metadata["model"] = model_name
             metadata["tool_calls"] = trace
             cached = False
@@ -139,12 +163,14 @@ class _DecoratorAgent:
 
         # M3: Persist this agent's output back to memory for downstream agents.
         if self._memory is not None and content:
-            await self._memory.save_context(self._session_id, self.name, content)
+            await self._memory.save_context(effective_session, self.name, content)
 
+        data: dict[str, Any] | None = None
         if self._output_schema is not None:
             try:
                 validated = self._output_schema.model_validate_json(content)
-                metadata["validated_output"] = validated.model_dump()
+                data = validated.model_dump()
+                metadata["validated_output"] = data
             except ValidationError as e:
                 raise AgentOutputValidationError(self.name, str(e)) from e
 
@@ -157,6 +183,7 @@ class _DecoratorAgent:
             duration=round(duration, 3),
             cached=cached,
             metadata=metadata,
+            data=data,
         )
 
     async def _run_tool_loop(
@@ -168,6 +195,7 @@ class _DecoratorAgent:
         initial_total_cost: float = 0.0,
         initial_trace: list[dict[str, Any]] | None = None,
         initial_seen_calls: set[tuple[str, str]] | None = None,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> tuple[str, int, float, str, list[dict[str, Any]]]:
         """Drive a ReAct-style loop: call the LLM, run any requested tools, repeat.
 
@@ -250,9 +278,25 @@ class _DecoratorAgent:
                     )
                 else:
                     # HITL: check approval policy before dispatching.
-                    if self._approval_policy is not None and self._approval_policy.requires_approval(
+                    if approval_policy is not None and approval_policy.requires_approval(
                         name, arguments
                     ):
+                        # Drain results for calls handled before the pause —
+                        # dispatched tasks would otherwise leak, and the saved
+                        # conversation must contain a tool message for every
+                        # already-processed call to stay API-valid on resume.
+                        for done_id, done_task in coros:
+                            results_map[done_id] = await done_task
+                        for done_id in call_order:
+                            _, dname, dargs, doutput = results_map[done_id]
+                            doutput = _truncate_output(doutput)
+                            trace.append(
+                                {"tool": dname, "arguments": dargs, "result": doutput}
+                            )
+                            messages.append(
+                                {"role": "tool", "tool_call_id": done_id, "content": doutput}
+                            )
+
                         pending: list[dict[str, Any]] = []
                         pause_idx = tool_calls.index(call)
                         for rc in tool_calls[pause_idx:]:
@@ -434,10 +478,13 @@ class _DecoratorAgent:
             initial_total_cost=pause_data["total_cost"],
             initial_trace=pause_data["trace"],
             initial_seen_calls=seen_calls,
+            approval_policy=self._approval_policy,
         )
 
-        total_tokens = pause_data["total_tokens"] + tokens_used
-        total_cost = pause_data["total_cost"] + cost
+        # _run_tool_loop was seeded with the pre-pause totals, so its return
+        # values already include them.
+        total_tokens = tokens_used
+        total_cost = cost
 
         if self._memory is not None and content:
             await self._memory.save_context(self._session_id, self.name, content)

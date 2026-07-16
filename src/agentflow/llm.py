@@ -13,6 +13,7 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from .exceptions import LLMError
 from .pricing import estimate_cost
+from .types import LLMResponse
 
 if TYPE_CHECKING:
     from .cache import ResponseCache
@@ -76,7 +77,7 @@ class LLM:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> LLMResponse:
         """Generate a completion from the LLM.
 
         Args:
@@ -90,8 +91,8 @@ class LLM:
             tool_choice: Optional OpenAI ``tool_choice`` ("auto", "none", etc.).
 
         Returns:
-            Dict with keys: content, tokens, prompt_tokens, completion_tokens,
-            duration, model, cached, tool_calls, finish_reason.
+            An :class:`~agentflow.types.LLMResponse`. Dict-style access
+            (``response["content"]``) still works as a deprecated shim.
         """
         effective_model = model or self.model
         use_cache = self._cache is not None and not tools
@@ -100,12 +101,17 @@ class LLM:
         cache_key = ""
         if use_cache:
             assert self._cache is not None
-            cache_key = self._cache.make_key(messages, effective_model)
+            cache_key = self._cache.make_key(
+                messages,
+                effective_model,
+                temperature=temperature if temperature is not None else self.temperature,
+                max_tokens=max_tokens or self.max_tokens,
+            )
             cached = await self._cache.get(cache_key)
             if cached is not None:
                 # A cache hit bills nothing — surface zero cost while keeping
                 # the (informational) token counts from the original call.
-                return {**cached, "cached": True, "cost": 0.0}
+                return LLMResponse(**{**cached, "cached": True, "cost": 0.0})
 
         start = time.perf_counter()
         last_error: Exception | None = None
@@ -116,10 +122,11 @@ class LLM:
             extra["tool_choice"] = tool_choice or "auto"
 
         for attempt in range(self.max_retries + 1):
+            # Rate limiting per attempt; acquire outside the try so a failed
+            # acquire is never paired with a release in the finally below.
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
             try:
-                # Rate limiting per attempt
-                if self._rate_limiter is not None:
-                    await self._rate_limiter.acquire()
                 response = await self._client.chat.completions.create(
                     model=effective_model,
                     messages=cast("list[ChatCompletionMessageParam]", messages),
@@ -133,23 +140,23 @@ class LLM:
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
 
-                result: dict[str, Any] = {
-                    "content": choice.message.content or "",
-                    "tokens": usage.total_tokens if usage else 0,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "cost": estimate_cost(response.model, prompt_tokens, completion_tokens),
-                    "duration": round(duration, 3),
-                    "model": response.model,
-                    "cached": False,
-                    "tool_calls": _serialize_tool_calls(choice.message.tool_calls),
-                    "finish_reason": choice.finish_reason,
-                }
+                result = LLMResponse(
+                    content=choice.message.content or "",
+                    tokens=usage.total_tokens if usage else 0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cost=estimate_cost(response.model, prompt_tokens, completion_tokens),
+                    duration=round(duration, 3),
+                    model=response.model,
+                    cached=False,
+                    tool_calls=_serialize_tool_calls(choice.message.tool_calls),
+                    finish_reason=choice.finish_reason,
+                )
 
                 # Write to cache (never cache tool-calling turns)
                 if use_cache:
                     assert self._cache is not None
-                    await self._cache.set(cache_key, {k: v for k, v in result.items() if k != "cached"})
+                    await self._cache.set(cache_key, result.model_dump(exclude={"cached"}))
 
                 return result
 
@@ -195,9 +202,9 @@ class LLM:
             Content string fragments as the model produces them.
         """
         effective_model = model or self.model
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire()
         try:
-            if self._rate_limiter is not None:
-                await self._rate_limiter.acquire()
             stream = await self._client.chat.completions.create(
                 model=effective_model,
                 messages=cast("list[ChatCompletionMessageParam]", messages),

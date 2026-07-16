@@ -21,9 +21,10 @@ import os
 import sys
 import time
 
+from pydantic import BaseModel, Field
+
 from agentflow import LLM, Agent, InMemoryCache, Pipeline, PipelineLogger
 from agentflow.types import Event
-from pydantic import BaseModel, Field
 
 # ─── Output Schema ─────────────────────────────────────────────────────────────
 
@@ -150,6 +151,9 @@ LEVEL_COLORS = ["\033[94m", "\033[96m", "\033[92m"]  # blue, cyan, green
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
 
 
 def color(text: str, code: str) -> str:
@@ -170,23 +174,23 @@ def handle_event(event: Event, start_time: float) -> None:
         tokens = event.data.get("tokens", 0)
         cached = " [cached]" if event.data.get("cached") else ""
         dur = event.data.get("duration", 0)
-        print(f"  {color('✓', '\033[92m')} {BOLD}{agent}{RESET}  "
+        print(f"  {color('✓', GREEN)} {BOLD}{agent}{RESET}  "
               f"{DIM}{tokens} tokens · {dur:.1f}s{cached}{RESET}")
 
     elif event.type == "agent_error":
-        print(f"  {color('✗', '\033[91m')} {event.agent}: {event.data.get('error', '')}")
+        print(f"  {color('✗', RED)} {event.agent}: {event.data.get('error', '')}")
 
     elif event.type == "pipeline_complete":
         total_tokens = event.data.get("total_tokens", 0)
         total_dur = event.data.get("total_duration", 0)
         levels = event.data.get("levels_executed", 0)
         wall = elapsed
-        print(f"\n  {color('→', '\033[93m')} {BOLD}Pipeline complete{RESET}  "
+        print(f"\n  {color('→', YELLOW)} {BOLD}Pipeline complete{RESET}  "
               f"{DIM}{total_tokens} tokens · {levels} levels · "
               f"wall time {wall:.2f}s (LLM sum {total_dur:.2f}s){RESET}\n")
 
     elif event.type == "pipeline_error":
-        print(f"\n  {color('✗ Pipeline error:', '\033[91m')} {event.data.get('error', '')}\n")
+        print(f"\n  {color('✗ Pipeline error:', RED)} {event.data.get('error', '')}\n")
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────

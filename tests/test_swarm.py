@@ -3,13 +3,11 @@
 import json
 
 import pytest
-from agentflow import Agent, AgentResult, BaseAgent, Tool
-from agentflow.agent import _DecoratorAgent
+
+from agentflow import Agent, AgentResult, BaseAgent
 from agentflow.exceptions import AgentError
 from agentflow.llm import LLM
 from agentflow.swarm import SupervisorAgent
-from agentflow.tools import tool
-
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -258,7 +256,7 @@ async def test_supervisor_receives_upstream_context():
     sup = SupervisorAgent("manager", "Manager", workers=[DummyWorker("w", "W", "ok")])
 
     llm = ScriptedLLM([_response("I acknowledge the context.")])
-    result = await sup.execute("Do X", {"preprocessor": "preprocessed data here"}, llm)
+    await sup.execute("Do X", {"preprocessor": "preprocessed data here"}, llm)
 
     # Verify the context was injected into the user message
     user_msg = llm.requests[0]["messages"][1]["content"]

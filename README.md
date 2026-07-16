@@ -106,11 +106,11 @@ def get_stock_price(ticker: str) -> dict:
     return {"ticker": ticker, "price": 229.87}
 
 @tool
-def calculator(expression: str) -> float:
-    """Evaluate an arithmetic expression like '10 * 229.87'."""
-    return eval(expression, {"__builtins__": {}}, {})
+def multiply(a: float, b: float) -> float:
+    """Multiply two numbers."""
+    return a * b
 
-@Agent(name="analyst", role="Financial Analyst", tools=[get_stock_price, calculator])
+@Agent(name="analyst", role="Financial Analyst", tools=[get_stock_price, multiply])
 async def analyst(task: str, context: dict) -> str:
     return task
 
@@ -299,25 +299,36 @@ log.log_pipeline_complete(result.run_id, result.total_tokens, result.total_durat
 # → {"timestamp": "...", "level": "INFO", "event": "pipeline_complete", "run_id": "a1b2c3d4", ...}
 ```
 
-## Why agentflow?
+## When to use agentflow (and when not to)
 
-| Feature | agentflowkit | LangChain | CrewAI |
-|---------|:---:|:---:|:---:|
-| Parallel DAG execution | ✅ | Partial | ❌ |
-| Tool / function calling | ✅ | ✅ | ✅ |
-| Built-in cost tracking | ✅ | Partial | ❌ |
-| Token streaming | ✅ | ✅ | Partial |
-| Install size | ~2 deps | 100+ deps | 30+ deps |
-| Async-first | ✅ | Partial | ❌ |
-| Decorator API | ✅ | ❌ | ❌ |
-| Built-in response cache | ✅ | Via callbacks | ❌ |
-| Observability hooks | ✅ | ✅ | Partial |
-| Fully typed (`py.typed`, strict) | ✅ | Partial | Partial |
-| Lines of core code | ~1.4k | ~200k | ~15k |
-| Per-agent timeout | ✅ | ❌ | ❌ |
-| Conditional branching | ✅ | ✅ | Partial |
+agentflow is a deliberately narrow library, not a framework. It covers one
+problem well: running typed, tool-using agents as a parallel DAG on any
+OpenAI-compatible API, with the operational basics (retries, timeouts,
+caching, cost tracking, streaming, hooks) built in rather than bolted on.
 
-agentflow is designed for engineers who want a **small, auditable, async-first** foundation for multi-agent systems — not a kitchen sink framework.
+What that buys you:
+
+- **Two runtime dependencies** (`openai`, `pydantic`). Optional extras pull in
+  Redis, Docker, or MQTT only if you use those features.
+- **Auditability.** The core is small enough to read in a sitting before you
+  put it in production, and it ships `py.typed` with `mypy --strict` clean.
+- **Async-native design.** Everything is `async` from the ground up;
+  parallelism is `asyncio.gather()` on DAG levels, not threads or callbacks.
+- **A short learning curve.** Two decorators (`@Agent`, `@tool`) and a
+  `Pipeline` are the whole public surface for most programs.
+
+What agentflow deliberately does **not** do — reach for LangChain, CrewAI, or
+similar frameworks if you need these:
+
+- No prompt-template library, document loaders, or vector-store integrations.
+- No agent marketplace or prebuilt personas; you write the agents.
+- No graph persistence / resumable long-running workflows across processes.
+- No provider abstraction beyond OpenAI-compatible endpoints (OpenAI, Groq,
+  OpenRouter, Ollama, vLLM, etc. all work; Bedrock-style native SDKs don't).
+
+If your project already lives inside a larger framework's ecosystem, use that
+ecosystem. agentflow is for engineers who want a foundation they can read,
+type-check, and own.
 
 ## Class-Based Agents
 

@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "agentflowkit"
-version = "0.4.0"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "openai" },
@@ -38,6 +38,10 @@ docs = [
 mqtt = [
     { name = "aiomqtt" },
 ]
+otel = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
+]
 redis = [
     { name = "chromadb" },
     { name = "redis" },
@@ -53,6 +57,8 @@ requires-dist = [
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.24" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.9" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.20" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -60,7 +66,7 @@ requires-dist = [
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
 ]
-provides-extras = ["docker", "mqtt", "redis", "docs", "dev"]
+provides-extras = ["docker", "mqtt", "otel", "redis", "docs", "dev"]
 
 [[package]]
 name = "aiohappyeyeballs"
