@@ -7,6 +7,119 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.6.0] — 2026-07-16
+
+First release shipping a pure-Python `py3-none-any` wheel. The only wheel
+published for 0.5.0 was a Windows/CPython-3.11 binary left over from the
+(since removed) C++ extension era — every other platform fell back to an
+sdist build. If 0.4.0/0.5.0 failed to install for you, this release is the fix.
+
+### Added
+- **Typed data plane**: `LLM.generate()` returns a typed `LLMResponse` pydantic
+  model. Dict-style access is kept as a deprecated shim (see Deprecated).
+- **Validated output flows downstream**: when an agent declares
+  `output_schema`, its validated output (`AgentResult.data`) is what downstream
+  agents receive in `context` — not the raw JSON string.
+- **Cost budgets**: `Pipeline(budget_usd=0.25)` enforces a hard USD ceiling per
+  run, raising `BudgetExceededError` when exceeded (checked after each level).
+- **OpenTelemetry adapter**: `agentflow.contrib.otel.OTelHooks` (install the
+  `otel` extra) — one import to spans.
+- **`AgentSpec`** is the public name of the object `@Agent` returns (previously
+  the private `_DecoratorAgent`); `@Agent(system_prompt=...)` fully replaces
+  the default role-based system prompt.
+- **`wall_time`** (elapsed) and **`agent_seconds`** (summed agent time) on
+  `PipelineResult`.
+- **`PUBLIC_API.md`** stability contract and **`SECURITY.md`**.
+- Showcase example `examples/earnings_triage.py`: diamond DAG with tools,
+  parallel analysts, typed output, budget, and cache — zero-key via Ollama/Groq.
+- CI test matrix extended to Python 3.13 and 3.14.
+
+### Fixed
+- `SupervisorAgent` crashed with `TypeError` when an upstream context value was
+  a validated-output dict.
+- `SupervisorAgent` billing race: concurrent runs sharing one instance
+  corrupted each other's worker token/cost accounting (now a run-scoped ledger).
+- A real agent failure alongside an HITL pause in the same DAG level was
+  silently swallowed; errors now take precedence and raise (the discarded
+  pause is logged).
+- Resumed agents dropped their validated `output_schema` result;
+  `AgentResult.data` is now populated on the resume path too.
+- `Pipeline.serve()` silently discarded the trigger's `context_data`; it is now
+  appended to the task prompt as a JSON block.
+- `Pipeline.resume()` could raise a spurious `ValidationError` when the last
+  saved context value was a dict.
+- Dependency-cycle errors now name the agents involved.
+
+### Changed
+- `run()`, `resume()`, and `stream()` now share a single execution driver
+  (previously three divergent copies of the same loop — the source of the
+  pause/error bugs above). `resume()` and `stream()` fire the same
+  `on_agent_start`/`on_agent_end`/`on_agent_error` hooks as `run()`.
+- `stream()` persists HITL pause state under a real `run_id` distinct from the
+  session id.
+- `Event.type` and `EventEmitter.emit` are typed with the new `EventType`
+  Literal (now includes `pipeline_paused`); `PipelineResult.status` is
+  `Literal["completed", "paused"]`.
+- `__version__` is single-sourced from package metadata (`importlib.metadata`).
+- Sandbox and trigger names are no longer re-exported from the top-level
+  package — import via `agentflow.sandbox` / `agentflow.triggers` (best-effort
+  modules outside the semver contract).
+- The C++ DAG engine and its build scaffolding were removed entirely: DAG
+  resolution is microseconds against multi-second LLM calls.
+
+### Deprecated (warn since 0.6, removal at 1.0)
+- Dict-style access on `LLMResponse` (`response["content"]`, `.get(...)`) —
+  use attribute access.
+- `set_session()` / `set_approval_policy()` — pass `session_id=` /
+  `approval_policy=` to `execute()`; mutating shared agent instances is unsafe
+  under concurrency.
+- `PipelineResult.total_duration` — use `agent_seconds` or `wall_time`.
+- The `_DecoratorAgent` name — use `AgentSpec`.
+
+---
+
+## [0.5.0] — 2026-07-03 (retroactive entry)
+
+Written after the fact on 2026-07-16: 0.4.0 and 0.5.0 shipped without
+changelog entries, violating this file's own policy. Reconstructed from git
+history. **Packaging note:** the only 0.5.0 wheel on PyPI is
+`cp311-cp311-win_amd64`; every other platform builds from the sdist. Prefer 0.6.0.
+
+### Added
+- **Swarm routing**: `SupervisorAgent` delegates sub-tasks to worker agents via
+  a generated `delegate_task` tool; worker tokens/cost bubble up to the
+  supervisor's result. Unexported `swarm_routing.DynamicSupervisorAgent`
+  prototype with depth-capped dynamic agent creation.
+- **Background memory distillation** (`agentflow.distillation`): compresses
+  long session memory with a version lock against concurrent writes.
+- **Human-in-the-loop**: `ApprovalPolicy` + `PauseExecution` +
+  `Pipeline.resume()` — pause on blocked tool calls, persist state to memory,
+  resume with approve/reject.
+- **Sandboxes** (`agentflow.sandbox`): Docker/subprocess code-execution tools.
+- **MQTT triggers** (`agentflow.triggers`) and `Pipeline.serve()` daemon mode.
+
+### Changed
+- The C++ DAG engine introduced in 0.4.0 was made optional (skipped when no
+  compiler is available) — and removed entirely in 0.6.0.
+
+---
+
+## [0.4.0] — 2026-07-02 (retroactive entry)
+
+### Added
+- C++ DAG engine via pybind11 (Kahn's algorithm) — later judged unnecessary
+  and removed; see the 0.5.0/0.6.0 notes.
+- Memory module (`BaseMemory`, `InMemoryContext`, `RedisContext`,
+  `VectorContext`) with per-session context injection into agent prompts.
+- ReAct loop hardening: duplicate-call detection, tool-output truncation,
+  sliding message window, per-iteration LLM retry.
+
+### Note
+- 0.2.0 and 0.3.0 were developed and documented below but never published to
+  PyPI, which jumped 0.1.0 → 0.4.0.
+
+---
+
 ## [0.3.0]
 
 ### Added
