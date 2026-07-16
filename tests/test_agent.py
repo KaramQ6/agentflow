@@ -1,6 +1,7 @@
 """Tests for the Agent decorator and BaseAgent."""
 
 import pytest
+
 from agentflow import Agent, AgentResult, BaseAgent
 from agentflow.agent import _DecoratorAgent
 

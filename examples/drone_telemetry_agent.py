@@ -36,10 +36,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from pydantic import BaseModel, Field  # noqa: E402
+
 from agentflow import LLM, Agent, Pipeline, PipelineLogger  # noqa: E402
 from agentflow.events import MQTTDaemon, PydanticTriggerPolicy  # noqa: E402
 from agentflow.types import PipelineResult  # noqa: E402
-from pydantic import BaseModel, Field  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

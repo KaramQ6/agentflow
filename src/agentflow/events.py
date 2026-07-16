@@ -179,6 +179,9 @@ class MQTTDaemon:
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
         self._backoff_jitter = backoff_jitter
+        # Strong references to in-flight handler tasks; asyncio only keeps
+        # weak references, so unanchored tasks can be garbage-collected mid-run.
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
 
     async def serve(self) -> None:
         """Run the MQTT daemon forever with automatic reconnection.
@@ -233,9 +236,11 @@ class MQTTDaemon:
                         if self._policy.evaluate(parsed):
                             task_prompt = self._policy.build_task_prompt(parsed)
                             # Non-blocking: spawn handler in background task
-                            asyncio.create_task(
+                            task = asyncio.create_task(
                                 self._handler(task_prompt, parsed, ctx)
                             )
+                            self._handler_tasks.add(task)
+                            task.add_done_callback(self._handler_tasks.discard)
 
             except asyncio.CancelledError:
                 _logger.info("MQTT daemon cancelled")

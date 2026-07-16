@@ -3,6 +3,7 @@
 import time
 
 import pytest
+
 from agentflow.cache import InMemoryCache, ResponseCache
 
 # ─── InMemoryCache ─────────────────────────────────────────────────────────────
@@ -85,6 +86,15 @@ def test_cache_key_is_order_stable():
     assert ResponseCache.make_key(msgs_a, "m") != ResponseCache.make_key(msgs_b, "m")
 
 
+def test_cache_key_differs_for_different_sampling_params():
+    """Requests that differ only in temperature/max_tokens must not collide."""
+    messages = [{"role": "user", "content": "hello"}]
+    key1 = ResponseCache.make_key(messages, "gpt-4o", temperature=0.0, max_tokens=100)
+    key2 = ResponseCache.make_key(messages, "gpt-4o", temperature=0.9, max_tokens=100)
+    key3 = ResponseCache.make_key(messages, "gpt-4o", temperature=0.0, max_tokens=500)
+    assert len({key1, key2, key3}) == 3
+
+
 # ─── LLM Cache Integration ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -96,7 +106,7 @@ async def test_llm_cache_hit_skips_api_call():
 
     cache = InMemoryCache()
     messages = [{"role": "user", "content": "what is 2+2"}]
-    key = ResponseCache.make_key(messages, "gpt-4o-mini")
+    key = ResponseCache.make_key(messages, "gpt-4o-mini", temperature=0.7, max_tokens=4096)
     await cache.set(key, {"content": "4", "tokens": 5, "duration": 0.1, "model": "gpt-4o-mini"})
 
     llm = LLM(model="gpt-4o-mini", api_key="fake", cache=cache)
@@ -124,6 +134,8 @@ async def test_llm_cache_miss_stores_result():
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
     mock_response.choices[0].message.content = "world"
+    mock_response.choices[0].message.tool_calls = None
+    mock_response.choices[0].finish_reason = "stop"
     mock_response.usage.total_tokens = 20
     mock_response.model = "gpt-4o-mini"
     # Replace the entire client so we control the call

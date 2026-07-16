@@ -3,9 +3,10 @@
 from types import SimpleNamespace
 
 import pytest
+from openai import APIError
+
 from agentflow import LLM
 from agentflow.exceptions import LLMError
-from openai import APIError
 
 
 def _chunk(content: str | None):

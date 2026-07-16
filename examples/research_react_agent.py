@@ -13,11 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any
 
-from agentflow import LLM, Agent, Pipeline, tool
 from pydantic import BaseModel, Field
 
+from agentflow import LLM, Agent, Pipeline, tool
 
 # ─── Mock Search Tool ──────────────────────────────────────────────────────────
 
@@ -128,12 +127,12 @@ async def main(topic: str) -> None:
         if "validated_output" in agent_result.metadata:
             rec = ResearchSummary(**agent_result.metadata["validated_output"])
             print(f"\n{'─' * 60}")
-            print(f"RESEARCH SUMMARY")
+            print("RESEARCH SUMMARY")
             print(f"  Topic:      {rec.topic}")
             print(f"  Confidence: {rec.confidence.upper()}")
             print(f"  Sources:    {', '.join(rec.sources_used[:4])}")
             print(f"  Summary:    {rec.summary[:300]}")
-            print(f"  Key Facts:")
+            print("  Key Facts:")
             for i, fact in enumerate(rec.key_facts, 1):
                 print(f"    {i}. {fact}")
 

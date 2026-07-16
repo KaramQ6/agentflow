@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 
-from agentflow import BaseTrigger, MQTTTrigger, Pipeline, PipelineResult
+from agentflow import Pipeline, PipelineResult
+from agentflow.triggers import BaseTrigger, MQTTTrigger
 from agentflow.agent import BaseAgent
 from agentflow.types import AgentResult
 

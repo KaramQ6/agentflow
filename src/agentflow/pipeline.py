@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -12,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from .agent import BaseAgent, _DecoratorAgent
 from .events import EventEmitter
-from .exceptions import AgentError, AgentTimeoutError, PipelineError
+from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
 from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
 from .memory import BaseMemory
@@ -23,13 +25,6 @@ if TYPE_CHECKING:
     from .triggers import BaseTrigger
 
 _logger = logging.getLogger(__name__)
-
-try:
-    from .cpp_core._agentflow_cpp import topological_sort_levels as _cpp_topo_sort  # noqa: I001
-    _CPP_AVAILABLE = True
-except ImportError:
-    _CPP_AVAILABLE = False
-    _logger.debug("C++ extension not available, using pure Python fallback")
 
 AgentLike = _DecoratorAgent | BaseAgent
 
@@ -42,7 +37,7 @@ class _PipelineNode:
         agent: AgentLike,
         depends_on: list[str],
         timeout: float | None = None,
-        condition: Callable[[dict[str, str]], bool] | None = None,
+        condition: Callable[[dict[str, Any]], bool] | None = None,
     ):
         self.agent = agent
         self.depends_on = depends_on
@@ -58,6 +53,8 @@ class Pipeline:
     Args:
         llm: The LLM provider for all agents.
         retry_failed_agents: How many times to retry a failed agent (default 0).
+        budget_usd: Optional hard cost ceiling for a single run. Checked after
+            each DAG level; exceeding it raises BudgetExceededError.
 
     Usage:
         pipe = Pipeline(llm=llm)
@@ -75,6 +72,7 @@ class Pipeline:
         memory: BaseMemory | None = None,
         session_id: str | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        budget_usd: float | None = None,
     ):
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
@@ -82,6 +80,7 @@ class Pipeline:
         self._memory = memory
         self._session_id = session_id
         self._approval_policy = approval_policy
+        self._budget_usd = budget_usd
         self._nodes: list[_PipelineNode] = []
         self._agent_names: set[str] = set()
 
@@ -90,7 +89,7 @@ class Pipeline:
         agent: AgentLike,
         depends_on: list[str] | None = None,
         timeout: float | None = None,
-        condition: Callable[[dict[str, str]], bool] | None = None,
+        condition: Callable[[dict[str, Any]], bool] | None = None,
     ) -> Pipeline:
         """Add an agent to the pipeline.
 
@@ -125,39 +124,11 @@ class Pipeline:
         Returns a list of levels; agents within the same level have no
         inter-dependencies and can run concurrently.
 
-        Uses the C++ pybind11 extension when available; falls back to
-        pure Python implementation otherwise.
-
         Example:
             researcher, fact_checker (no deps) -> Level 0  [parallel]
             writer (depends on both)           -> Level 1
         """
         node_map = {n.agent.name: n for n in self._nodes}
-
-        if _CPP_AVAILABLE:
-            return self._resolve_levels_cpp(node_map)
-
-        return self._resolve_levels_python(node_map)
-
-    def _resolve_levels_cpp(
-        self, node_map: dict[str, _PipelineNode]
-    ) -> list[list[_PipelineNode]]:
-        nodes = [n.agent.name for n in self._nodes]
-        edges: list[tuple[str, str]] = []
-        for node in self._nodes:
-            for dep in node.depends_on:
-                edges.append((dep, node.agent.name))
-
-        try:
-            level_names = _cpp_topo_sort(nodes, edges)
-        except RuntimeError as exc:
-            raise PipelineError(f"C++ topological sort failed: {exc}") from exc
-
-        return [[node_map[name] for name in level] for level in level_names]
-
-    def _resolve_levels_python(
-        self, node_map: dict[str, _PipelineNode]
-    ) -> list[list[_PipelineNode]]:
         # Build in-degree count
         in_degree: dict[str, int] = {n.agent.name: 0 for n in self._nodes}
         dependents: dict[str, list[str]] = {n.agent.name: [] for n in self._nodes}
@@ -194,7 +165,7 @@ class Pipeline:
         self,
         node: _PipelineNode,
         task: str,
-        context: dict[str, str],
+        context: dict[str, Any],
         level_index: int,
         session_id: str,
     ) -> AgentResult:
@@ -202,17 +173,21 @@ class Pipeline:
         agent = node.agent
         attempts = self._retry_failed_agents + 1
 
-        # M3: Set session ID on agents that support memory.
-        if hasattr(agent, 'set_session'):
-            agent.set_session(session_id)
-
-        # HITL: Attach approval policy so agent can intercept sensitive tool calls.
-        if self._approval_policy is not None and hasattr(agent, 'set_approval_policy'):
-            agent.set_approval_policy(self._approval_policy)
-
         for attempt in range(attempts):
             try:
-                coro = agent.execute(task, context, self._llm)
+                if isinstance(agent, _DecoratorAgent):
+                    # Run-scoped state travels with the call — mutating a
+                    # shared agent instance would cross-contaminate
+                    # concurrent pipeline runs.
+                    coro = agent.execute(
+                        task,
+                        context,
+                        self._llm,
+                        session_id=session_id,
+                        approval_policy=self._approval_policy,
+                    )
+                else:
+                    coro = agent.execute(task, context, self._llm)
                 if node.timeout is not None:
                     try:
                         result = await asyncio.wait_for(coro, timeout=node.timeout)
@@ -247,7 +222,7 @@ class Pipeline:
         to_run: list[_PipelineNode],
         level_results: list[Any],
         results: dict[str, AgentResult],
-        context: dict[str, str],
+        context: dict[str, Any],
     ) -> str:
         """Collect completed agent results and persist HITL pause state to memory.
 
@@ -258,7 +233,7 @@ class Pipeline:
         for n, r in zip(to_run, level_results, strict=False):
             if isinstance(r, AgentResult):
                 results[n.agent.name] = r
-                context[n.agent.name] = r.output
+                context[n.agent.name] = r.data if r.data is not None else r.output
                 last_output = r.output
 
         if self._memory is not None:
@@ -282,6 +257,14 @@ class Pipeline:
 
         return last_output
 
+    def _check_budget(self, results: dict[str, AgentResult]) -> None:
+        """Raise BudgetExceededError if accumulated cost passed ``budget_usd``."""
+        if self._budget_usd is None:
+            return
+        spent = sum(r.cost for r in results.values())
+        if spent > self._budget_usd:
+            raise BudgetExceededError(self._budget_usd, round(spent, 6))
+
     async def run(self, task: str) -> PipelineResult:
         """Execute the pipeline with parallel level execution.
 
@@ -294,9 +277,10 @@ class Pipeline:
             result has ``status="paused"`` and ``pause_info`` containing the
             details needed to later call :meth:`resume`.
         """
+        wall_start = time.perf_counter()
         levels = self._resolve_levels()
         results: dict[str, AgentResult] = {}
-        context: dict[str, str] = {}
+        context: dict[str, Any] = {}
         last_output = ""
         run_id = uuid.uuid4().hex[:8]
         session_id = self._session_id or run_id
@@ -340,6 +324,7 @@ class Pipeline:
                         total_tokens=sum(r.tokens_used for r in results.values()),
                         total_cost=round(sum(r.cost for r in results.values()), 6),
                         total_duration=round(sum(r.duration for r in results.values()), 3),
+                        wall_time=round(time.perf_counter() - wall_start, 3),
                         run_id=run_id,
                         levels_executed=level_index,
                         agents_with_cache_hits=sum(1 for r in results.values() if r.cached),
@@ -360,10 +345,12 @@ class Pipeline:
                         safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
                     raise result
                 results[node.agent.name] = result
-                context[node.agent.name] = result.output
+                context[node.agent.name] = result.data if result.data is not None else result.output
                 last_output = result.output
                 if self._hooks is not None:
                     safe_invoke(self._hooks, "on_agent_end", result)
+
+            self._check_budget(results)
 
         total_tokens = sum(r.tokens_used for r in results.values())
         total_cost = sum(r.cost for r in results.values())
@@ -376,6 +363,7 @@ class Pipeline:
             total_tokens=total_tokens,
             total_cost=round(total_cost, 6),
             total_duration=round(total_duration, 3),
+            wall_time=round(time.perf_counter() - wall_start, 3),
             run_id=run_id,
             levels_executed=len(levels),
             agents_with_cache_hits=cache_hits,
@@ -411,6 +399,7 @@ class Pipeline:
                            exists for the session, or the paused agent is
                            no longer part of the pipeline.
         """
+        wall_start = time.perf_counter()
         if self._memory is None:
             raise PipelineError("Cannot resume without a memory backend configured")
 
@@ -433,7 +422,7 @@ class Pipeline:
         task: str = pipeline_state["task"]
         run_id: str = pipeline_state["run_id"]
         current_level: int = pipeline_state["current_level"]
-        context: dict[str, str] = pipeline_state["context"]
+        context: dict[str, Any] = pipeline_state["context"]
         paused_name: str = pipeline_state["paused_agent_name"]
 
         results: dict[str, AgentResult] = {}
@@ -462,7 +451,9 @@ class Pipeline:
             pause_data, self._llm, approved, human_feedback
         )
         results[paused_name] = agent_result
-        context[paused_name] = agent_result.output
+        context[paused_name] = (
+            agent_result.data if agent_result.data is not None else agent_result.output
+        )
         last_output = agent_result.output
 
         # Continue with remaining pipeline levels.
@@ -477,11 +468,6 @@ class Pipeline:
 
             if not to_run:
                 continue
-
-            if self._approval_policy is not None:
-                for node in to_run:
-                    if hasattr(node.agent, 'set_approval_policy'):
-                        node.agent.set_approval_policy(self._approval_policy)
 
             level_coros = [
                 self._execute_node(
@@ -509,6 +495,7 @@ class Pipeline:
                         total_tokens=sum(r.tokens_used for r in results.values()),
                         total_cost=round(sum(r.cost for r in results.values()), 6),
                         total_duration=round(sum(r.duration for r in results.values()), 3),
+                        wall_time=round(time.perf_counter() - wall_start, 3),
                         run_id=run_id,
                         levels_executed=level_index,
                         agents_with_cache_hits=sum(1 for r in results.values() if r.cached),
@@ -528,8 +515,10 @@ class Pipeline:
                         safe_invoke(self._hooks, "on_agent_error", node.agent.name, err)
                     raise result
                 results[node.agent.name] = result
-                context[node.agent.name] = result.output
+                context[node.agent.name] = result.data if result.data is not None else result.output
                 last_output = result.output
+
+            self._check_budget(results)
 
         # Clean up HITL keys from memory.
         await self._memory.delete_key(session_id, "__hitl_pipeline")
@@ -546,6 +535,7 @@ class Pipeline:
             total_tokens=total_tokens,
             total_cost=round(total_cost, 6),
             total_duration=round(total_duration, 3),
+            wall_time=round(time.perf_counter() - wall_start, 3),
             run_id=run_id,
             levels_executed=len(levels),
             agents_with_cache_hits=cache_hits,
@@ -558,10 +548,11 @@ class Pipeline:
         The final event has type "pipeline_complete", "pipeline_error",
         or "pipeline_paused" (when the HITL policy blocks a tool call).
         """
+        wall_start = time.perf_counter()
         emitter = EventEmitter()
         levels = self._resolve_levels()
         results: dict[str, AgentResult] = {}
-        context: dict[str, str] = {}
+        context: dict[str, Any] = {}
 
         async def _run() -> None:
             session_id = self._session_id or uuid.uuid4().hex[:8]
@@ -616,7 +607,9 @@ class Pipeline:
                             emitter.emit("agent_error", agent=node.agent.name, error=str(result))
                             raise result
                         results[node.agent.name] = result
-                        context[node.agent.name] = result.output
+                        context[node.agent.name] = (
+                            result.data if result.data is not None else result.output
+                        )
                         emitter.emit(
                             "agent_complete",
                             agent=node.agent.name,
@@ -627,6 +620,8 @@ class Pipeline:
                             output_preview=result.output[:200],
                         )
 
+                    self._check_budget(results)
+
                 total_tokens = sum(r.tokens_used for r in results.values())
                 total_cost = sum(r.cost for r in results.values())
                 total_duration = sum(r.duration for r in results.values())
@@ -635,6 +630,7 @@ class Pipeline:
                     total_tokens=total_tokens,
                     total_cost=round(total_cost, 6),
                     total_duration=round(total_duration, 3),
+                    wall_time=round(time.perf_counter() - wall_start, 3),
                     agents_completed=len(results),
                     levels_executed=len(levels),
                 )
@@ -645,10 +641,16 @@ class Pipeline:
 
         run_task = asyncio.create_task(_run())
 
-        async for event in emitter.stream():
-            yield event
-
-        await run_task
+        try:
+            async for event in emitter.stream():
+                yield event
+        finally:
+            # Also reached when the consumer abandons the generator early —
+            # don't leave the pipeline running in the background.
+            if not run_task.done():
+                run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
 
     async def serve(
         self,

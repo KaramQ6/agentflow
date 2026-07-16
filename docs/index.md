@@ -8,11 +8,11 @@ caching, cost tracking, timeouts, and real-time streaming.
 from agentflow import Agent, Pipeline, LLM, tool
 
 @tool
-def calculator(expression: str) -> float:
-    """Evaluate an arithmetic expression."""
-    return eval(expression, {"__builtins__": {}}, {})
+def percentage(part: float, whole: float) -> float:
+    """Return `part` percent of `whole`."""
+    return part / 100 * whole
 
-@Agent(name="analyst", role="Analyst", tools=[calculator])
+@Agent(name="analyst", role="Analyst", tools=[percentage])
 async def analyst(task: str, context: dict) -> str:
     return task
 

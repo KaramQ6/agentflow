@@ -17,6 +17,35 @@ def _short_uuid() -> str:
     return uuid.uuid4().hex[:8]
 
 
+class LLMResponse(BaseModel):
+    """Typed result of :meth:`agentflow.LLM.generate`.
+
+    Supports dict-style access (``response["content"]``, ``response.get(...)``)
+    as a migration shim for code written against the pre-0.6 dict return type.
+    Prefer attribute access; the dict-style shim is deprecated.
+    """
+
+    content: str = ""
+    tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+    duration: float = 0.0
+    model: str = ""
+    cached: bool = False
+    tool_calls: list[dict[str, Any]] | None = None
+    finish_reason: str | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key) from None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
 class AgentResult(BaseModel):
     """Result from a single agent execution."""
 
@@ -29,6 +58,12 @@ class AgentResult(BaseModel):
     level: int = 0
     timestamp: str = Field(default_factory=_utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    data: dict[str, Any] | None = None
+    """Validated structured output (``output_schema.model_dump()``), if any.
+
+    When set, downstream agents receive this dict as the context value
+    instead of the raw ``output`` string.
+    """
 
 
 class PipelineResult(BaseModel):
@@ -44,11 +79,20 @@ class PipelineResult(BaseModel):
     total_tokens: int = 0
     total_cost: float = 0.0
     total_duration: float = 0.0
+    """Sum of per-agent durations. Deprecated name: parallel agents overlap,
+    so this is CPU-style "agent seconds", not elapsed time. Prefer
+    :attr:`agent_seconds` for this value and :attr:`wall_time` for elapsed."""
+    wall_time: float = 0.0
     run_id: str = Field(default_factory=_short_uuid)
     levels_executed: int = 0
     agents_with_cache_hits: int = 0
     status: str = "completed"
     pause_info: dict[str, Any] | None = None
+
+    @property
+    def agent_seconds(self) -> float:
+        """Sum of per-agent execution durations (parallel agents overlap)."""
+        return self.total_duration
 
     def get(self, agent_name: str) -> AgentResult | None:
         """Get a specific agent's result."""

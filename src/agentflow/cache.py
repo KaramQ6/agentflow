@@ -29,9 +29,27 @@ class ResponseCache(ABC):
         ...
 
     @staticmethod
-    def make_key(messages: list[dict[str, Any]], model: str) -> str:
-        """Deterministic SHA-256 cache key from messages + model."""
-        payload = json.dumps({"messages": messages, "model": model}, sort_keys=True, default=str)
+    def make_key(
+        messages: list[dict[str, Any]],
+        model: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Deterministic SHA-256 cache key from messages + sampling parameters.
+
+        Temperature and max_tokens are part of the key so requests that differ
+        only in sampling settings never collide.
+        """
+        payload = json.dumps(
+            {
+                "messages": messages,
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            sort_keys=True,
+            default=str,
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -61,7 +79,9 @@ class InMemoryCache(ResponseCache):
         if time.monotonic() > expiry:
             del self._store[key]
             return None
-        return value
+        # Return a copy so caller mutations can't poison the cached entry
+        # (matches RedisCache, which deserializes a fresh dict per get).
+        return dict(value)
 
     async def set(self, key: str, value: dict[str, Any], ttl: int | None = None) -> None:
         if len(self._store) >= self._max_size:

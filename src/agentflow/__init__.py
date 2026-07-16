@@ -1,6 +1,22 @@
-"""agentflow - Lightweight multi-agent AI pipeline framework."""
+"""agentflow - Lightweight multi-agent AI pipeline framework.
 
-__version__ = "0.3.0"
+The core public surface is deliberately narrow: two decorators (``@Agent``,
+``@tool``), a ``Pipeline``, and an ``LLM``. Peripheral capabilities live in
+opt-in submodules and are NOT re-exported here:
+
+- ``agentflow.sandbox``   — Docker/subprocess code-execution sandboxes
+- ``agentflow.triggers``  — event-driven daemon triggers (MQTT)
+- ``agentflow.distillation`` — background memory compression
+
+See PUBLIC_API.md for the stability contract.
+"""
+
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("agentflowkit")
+except PackageNotFoundError:  # running from a source tree without install
+    __version__ = "0.0.0.dev0"
 
 from .agent import Agent, BaseAgent
 from .cache import InMemoryCache, RedisCache, ResponseCache
@@ -10,6 +26,7 @@ from .exceptions import (
     AgentFlowError,
     AgentOutputValidationError,
     AgentTimeoutError,
+    BudgetExceededError,
     LLMError,
     PipelineError,
     ToolError,
@@ -22,19 +39,9 @@ from .observability import Hooks, LoggingHooks
 from .pipeline import Pipeline
 from .pricing import estimate_cost, register_price
 from .rate_limiter import RateLimiter
-from .sandbox import (
-    DockerSandbox,
-    SandboxError,
-    SandboxTimeoutError,
-    SubprocessSandbox,
-    create_sandbox,
-    execute_code,
-    sandboxed_tool,
-)
 from .swarm import SupervisorAgent
 from .tools import Tool, tool
-from .triggers import BaseTrigger, MQTTTrigger
-from .types import AgentResult, Event, PipelineResult
+from .types import AgentResult, Event, LLMResponse, PipelineResult
 
 __all__ = [
     # Core
@@ -46,20 +53,13 @@ __all__ = [
     # Tools
     "Tool",
     "tool",
-    # Sandbox
-    "DockerSandbox",
-    "SubprocessSandbox",
-    "SandboxError",
-    "SandboxTimeoutError",
-    "create_sandbox",
-    "execute_code",
-    "sandboxed_tool",
     # Cost
     "estimate_cost",
     "register_price",
     # Data models
     "AgentResult",
     "PipelineResult",
+    "LLMResponse",
     "Event",
     "EventEmitter",
     # Memory
@@ -69,9 +69,6 @@ __all__ = [
     "VectorContext",
     # Rate limiting
     "RateLimiter",
-    # Triggers
-    "BaseTrigger",
-    "MQTTTrigger",
     # Caching
     "ResponseCache",
     "InMemoryCache",
@@ -86,6 +83,7 @@ __all__ = [
     "AgentError",
     "AgentTimeoutError",
     "AgentOutputValidationError",
+    "BudgetExceededError",
     "PipelineError",
     "LLMError",
     "ToolError",

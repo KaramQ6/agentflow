@@ -43,3 +43,19 @@ class ToolError(AgentFlowError):
 
 class PipelineError(AgentFlowError):
     """Raised when pipeline orchestration fails."""
+
+
+class BudgetExceededError(PipelineError):
+    """Raised when a pipeline run's accumulated cost exceeds ``budget_usd``.
+
+    The budget is checked after each DAG level completes (an in-flight LLM
+    call cannot be aborted), so the final cost may overshoot by at most one
+    level's spend.
+    """
+
+    def __init__(self, budget_usd: float, spent_usd: float):
+        self.budget_usd = budget_usd
+        self.spent_usd = spent_usd
+        super().__init__(
+            f"Pipeline budget exceeded: spent ${spent_usd:.6f} of ${budget_usd:.6f} budget"
+        )
