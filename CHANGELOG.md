@@ -9,6 +9,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] — 2026-07-29
+
+Correctness and honesty release. Three things this fixes were actively
+misleading: cost tracking reported `$0.00` on the provider the quickstart
+recommends, two shipped examples could not run at all, and the coverage gate
+claimed 90% while the suite measured 78%.
+
+**Upgrading.** Two behaviour changes are worth reading before you take this:
+
+- A failing DAG level now cancels its remaining agents. If you relied on
+  siblings completing after a failure, they no longer will — their results were
+  discarded anyway.
+- `pipe.add(agent, depends_on=["not_added_yet"])` no longer raises inside
+  `add()`. Unknown dependencies raise when the graph is resolved
+  (`run`/`stream`/`explain`). If you asserted on that early error, move the
+  assertion.
+
+`agentflow.distillation` is gone. It was never exported; if you imported it by
+path, pin `0.6.1` or lift the module out of git history.
+
 ### Added
 - **Cost visibility for unpriced models.** A model with no pricing entry still
   costs `$0.00`, but it is no longer silent: it is logged once per process, and
