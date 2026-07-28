@@ -38,8 +38,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pydantic import BaseModel, Field  # noqa: E402
 
-from agentflow import LLM, Agent, Pipeline, PipelineLogger  # noqa: E402
-from agentflow.events import MQTTDaemon, PydanticTriggerPolicy  # noqa: E402
+from agentflow import LLM, Agent, LoggingHooks, Pipeline  # noqa: E402
+from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy  # noqa: E402
 from agentflow.types import PipelineResult  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -80,7 +80,7 @@ telemetry_policy = PydanticTriggerPolicy(
 # ─── Agents ─────────────────────────────────────────────────────────────────────
 
 
-@Agent(name="threat_assessor", role="Drone Safety Assessor", timeout=30)
+@Agent(name="threat_assessor", role="Drone Safety Assessor")
 async def threat_assessor(task: str, context: dict) -> str:
     return (
         f"You are a drone flight safety analyst.  Examine the telemetry alert "
@@ -92,7 +92,7 @@ async def threat_assessor(task: str, context: dict) -> str:
     )
 
 
-@Agent(name="emergency_responder", role="Drone Emergency Responder", timeout=30)
+@Agent(name="emergency_responder", role="Drone Emergency Responder")
 async def emergency_responder(task: str, context: dict) -> str:
     assessment = context.get("threat_assessor", "")
     return (
@@ -119,22 +119,20 @@ async def handle_trigger(
 
     llm = LLM(
         model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        provider="groq",
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.environ.get("GROQ_API_KEY"),
     )
 
-    pipe = Pipeline(
-        llm=llm,
-        hooks=PipelineLogger(verbose=True),
-    )
-    pipe.add(threat_assessor)
-    pipe.add(emergency_responder, depends_on=["threat_assessor"])
+    pipe = Pipeline(llm=llm, hooks=LoggingHooks("drone-telemetry"))
+    pipe.add(threat_assessor, timeout=30)
+    pipe.add(emergency_responder, depends_on=["threat_assessor"], timeout=30)
 
     try:
         result: PipelineResult = await pipe.run(task_prompt)
         logger.info(
             "Run %s: severity assessed in %.2fs (%d tokens, $%.4f)",
             result.run_id,
-            result.total_duration,
+            result.wall_time,
             result.total_tokens,
             result.total_cost,
         )
