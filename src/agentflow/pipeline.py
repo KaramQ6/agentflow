@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from .agent import AgentLike, AgentSpec
@@ -39,6 +39,75 @@ def _unpriced_models_used(results: dict[str, AgentResult]) -> list[str]:
         if (model := r.metadata.get("model")) and not is_priced(model)
     }
     return sorted(models)
+
+
+async def _gather_level(
+    coros: list[Coroutine[Any, Any, AgentResult]],
+) -> list[AgentResult | BaseException]:
+    """Run *coros* concurrently, cancelling the rest once one really fails.
+
+    ``asyncio.gather(..., return_exceptions=True)`` waits for every sibling
+    even after one has raised. A failing level discards its results and
+    propagates the error, so those siblings were only ever going to burn tokens
+    and wall time — in a library whose pitch is per-run cost, that is money
+    spent on output nobody reads.
+
+    A :class:`~agentflow.hitl.PauseExecution` is control flow, not a failure,
+    and does **not** cancel anything: the pause path persists every sibling
+    result alongside the pause so the run can resume.
+
+    Returns results positionally, mirroring ``gather``. A sibling cancelled by
+    this function is reported as a :class:`asyncio.CancelledError`.
+    """
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    pending: set[asyncio.Task[AgentResult]] = set(tasks)
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if any(_is_real_failure(task) for task in done):
+                break
+    except asyncio.CancelledError:
+        # The whole run was cancelled from outside (e.g. a stream consumer
+        # abandoned the generator) — take the level down with it.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    results: list[AgentResult | BaseException] = []
+    for task in tasks:
+        if task.cancelled():
+            results.append(asyncio.CancelledError())
+            continue
+        error = task.exception()
+        results.append(error if error is not None else task.result())
+    return results
+
+
+def _last_output_of(results: dict[str, AgentResult]) -> str:
+    """The most recently recorded agent output, or ``""`` when nothing ran."""
+    return next(reversed(results.values())).output if results else ""
+
+
+def _levels_completed(results: dict[str, AgentResult]) -> int:
+    """How many DAG levels produced results (``AgentResult.level`` is 0-indexed)."""
+    return max((r.level for r in results.values()), default=-1) + 1
+
+
+def _is_real_failure(task: asyncio.Task[AgentResult]) -> bool:
+    """Whether *task* finished with an error that should stop its level."""
+    if task.cancelled():
+        return False
+    error = task.exception()
+    return error is not None and not isinstance(error, PauseExecution)
 
 
 class _PipelineNode:
@@ -382,7 +451,7 @@ class Pipeline:
                 for node in to_run
             ]
 
-            level_results = await asyncio.gather(*level_coros, return_exceptions=True)
+            level_results = await _gather_level(level_coros)
 
             first_error: tuple[_PipelineNode, BaseException] | None = None
             pause: PauseExecution | None = None
@@ -390,6 +459,10 @@ class Pipeline:
                 if isinstance(result, PauseExecution):
                     if pause is None:
                         pause = result
+                elif isinstance(result, asyncio.CancelledError):
+                    # Cancelled by the fail-fast above; the agent that actually
+                    # failed is another entry in this same list.
+                    continue
                 elif isinstance(result, BaseException) and first_error is None:
                     first_error = (node, result)
 
@@ -460,15 +533,27 @@ class Pipeline:
         if self._hooks is not None:
             safe_invoke(self._hooks, "on_pipeline_start", task, run_id, len(self._nodes))
 
-        last_output, pause, levels_executed = await self._run_levels(
-            levels=levels,
-            start_level=0,
-            task=task,
-            context=context,
-            results=results,
-            session_id=session_id,
-            run_id=run_id,
-        )
+        try:
+            last_output, pause, levels_executed = await self._run_levels(
+                levels=levels,
+                start_level=0,
+                task=task,
+                context=context,
+                results=results,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        except BudgetExceededError as exc:
+            # The completed levels have already been paid for; hand them back
+            # rather than making the ceiling destroy what it was protecting.
+            exc.partial_result = self._build_result(
+                last_output=_last_output_of(results),
+                results=results,
+                run_id=run_id,
+                levels_executed=_levels_completed(results),
+                wall_start=wall_start,
+            )
+            raise
 
         pipeline_result = self._build_result(
             last_output=last_output,
@@ -572,15 +657,25 @@ class Pipeline:
 
         # Continue with remaining pipeline levels (supports nested pauses).
         levels = self._resolve_levels()
-        tail_output, pause, levels_executed = await self._run_levels(
-            levels=levels,
-            start_level=current_level + 1,
-            task=task,
-            context=context,
-            results=results,
-            session_id=session_id,
-            run_id=run_id,
-        )
+        try:
+            tail_output, pause, levels_executed = await self._run_levels(
+                levels=levels,
+                start_level=current_level + 1,
+                task=task,
+                context=context,
+                results=results,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        except BudgetExceededError as exc:
+            exc.partial_result = self._build_result(
+                last_output=_last_output_of(results),
+                results=results,
+                run_id=run_id,
+                levels_executed=_levels_completed(results),
+                wall_start=wall_start,
+            )
+            raise
         last_output = tail_output or last_output
 
         if pause is not None:

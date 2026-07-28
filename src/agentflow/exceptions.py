@@ -1,5 +1,12 @@
 """agentflow - Lightweight multi-agent AI pipeline framework."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .types import PipelineResult
+
 
 class AgentFlowError(Exception):
     """Base exception for agentflow."""
@@ -51,11 +58,24 @@ class BudgetExceededError(PipelineError):
     The budget is checked after each DAG level completes (an in-flight LLM
     call cannot be aborted), so the final cost may overshoot by at most one
     level's spend.
+
+    Attributes:
+        partial_result: The ``PipelineResult`` for the levels that did
+            complete, or ``None`` when the error was raised outside a run. The
+            work it describes has already been paid for — abandoning it is the
+            one thing a cost ceiling should not force you to do. Read
+            ``.results`` for the agents that finished, or resume from them.
     """
 
-    def __init__(self, budget_usd: float, spent_usd: float):
+    def __init__(
+        self,
+        budget_usd: float,
+        spent_usd: float,
+        partial_result: PipelineResult | None = None,
+    ):
         self.budget_usd = budget_usd
         self.spent_usd = spent_usd
+        self.partial_result = partial_result
         super().__init__(
             f"Pipeline budget exceeded: spent ${spent_usd:.6f} of ${budget_usd:.6f} budget"
         )
