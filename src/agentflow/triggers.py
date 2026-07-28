@@ -142,6 +142,14 @@ class MQTTTrigger(BaseTrigger):
                 yield task_prompt, ctx
 
 
+class _LenientFields(dict[str, Any]):
+    """Format map that leaves an unknown placeholder in place instead of raising."""
+
+    def __missing__(self, key: str) -> str:
+        _logger.warning("Trigger prompt template references unknown field %r", key)
+        return "{" + key + "}"
+
+
 class TriggerPolicy(ABC):
     """Abstract base for trigger policies that evaluate payload conditions.
 
@@ -207,15 +215,21 @@ class PydanticTriggerPolicy(TriggerPolicy):
         return self._condition(validated)
 
     def build_task_prompt(self, payload: dict[str, Any]) -> str:
+        """Render the prompt template against the validated payload.
+
+        ``{data}`` is always the raw JSON payload and wins over a model field
+        of the same name. Placeholders naming a field that does not exist are
+        left in the prompt verbatim and logged, rather than raising: this runs
+        inside a daemon processing live messages, where a template typo must
+        not take down the listener.
+        """
         try:
-            validated = self._model(**payload)
-            fields = validated.model_dump()
+            fields: dict[str, Any] = self._model(**payload).model_dump()
         except ValidationError:
             fields = payload
-        try:
-            return self._prompt_template.format(**fields, data=json.dumps(payload))
-        except KeyError:
-            return self._prompt_template.format(data=json.dumps(payload))
+        return self._prompt_template.format_map(
+            _LenientFields(fields, data=json.dumps(payload))
+        )
 
 
 class MQTTDaemon:
@@ -281,6 +295,12 @@ class MQTTDaemon:
         # Strong references to in-flight handler tasks; asyncio only keeps
         # weak references, so unanchored tasks can be garbage-collected mid-run.
         self._handler_tasks: set[asyncio.Task[Any]] = set()
+
+    async def _backoff(self, delay: float) -> float:
+        """Wait *delay* seconds (plus jitter) and return the next delay."""
+        jitter = time.monotonic() % 1 * self._backoff_jitter
+        await asyncio.sleep(delay + jitter)
+        return min(delay * 2, self._backoff_max)
 
     async def serve(self) -> None:
         """Run the MQTT daemon forever with automatic reconnection.
@@ -350,7 +370,14 @@ class MQTTDaemon:
                     exc,
                     delay,
                 )
-                # Exponential backoff with jitter
-                jitter = time.monotonic() % 1 * self._backoff_jitter
-                await asyncio.sleep(delay + jitter)
-                delay = min(delay * 2, self._backoff_max)
+                delay = await self._backoff(delay)
+
+            else:
+                # The stream ended without raising — the broker closed the
+                # subscription cleanly. Reconnecting straight away would spin
+                # this loop with no suspension point and starve the event loop,
+                # so a clean end backs off exactly like a dropped connection.
+                _logger.warning(
+                    "MQTT message stream ended. Reconnecting in %.1fs...", delay
+                )
+                delay = await self._backoff(delay)
