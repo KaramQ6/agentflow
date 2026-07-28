@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from .agent import AgentLike, AgentSpec
@@ -19,12 +20,111 @@ from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
 from .memory import BaseMemory
 from .observability import Hooks, safe_invoke
+from .pricing import is_priced
 from .types import AgentResult, Event, PipelineResult
 
 if TYPE_CHECKING:
     from .triggers import BaseTrigger
 
 _logger = logging.getLogger(__name__)
+
+
+def _unpriced_models_used(results: dict[str, AgentResult]) -> list[str]:
+    """Models in *results* with no pricing entry, so their cost is a placeholder.
+
+    Sorted for a stable, comparable value.
+    """
+    models = {
+        model
+        for r in results.values()
+        if (model := r.metadata.get("model")) and not is_priced(model)
+    }
+    return sorted(models)
+
+
+async def _gather_level(
+    coros: list[Coroutine[Any, Any, AgentResult]],
+) -> list[AgentResult | BaseException]:
+    """Run *coros* concurrently, cancelling the rest once one really fails.
+
+    ``asyncio.gather(..., return_exceptions=True)`` waits for every sibling
+    even after one has raised. A failing level discards its results and
+    propagates the error, so those siblings were only ever going to burn tokens
+    and wall time — in a library whose pitch is per-run cost, that is money
+    spent on output nobody reads.
+
+    A :class:`~agentflow.hitl.PauseExecution` is control flow, not a failure,
+    and does **not** cancel anything: the pause path persists every sibling
+    result alongside the pause so the run can resume.
+
+    Returns results positionally, mirroring ``gather``. A sibling cancelled by
+    this function is reported as a :class:`asyncio.CancelledError`.
+    """
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    pending: set[asyncio.Task[AgentResult]] = set(tasks)
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if any(_is_real_failure(task) for task in done):
+                break
+    except asyncio.CancelledError:
+        # The whole run was cancelled from outside (e.g. a stream consumer
+        # abandoned the generator) — take the level down with it.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    results: list[AgentResult | BaseException] = []
+    for task in tasks:
+        if task.cancelled():
+            results.append(asyncio.CancelledError())
+            continue
+        error = task.exception()
+        results.append(error if error is not None else task.result())
+    return results
+
+
+def _last_output_of(results: dict[str, AgentResult]) -> str:
+    """The most recently recorded agent output, or ``""`` when nothing ran."""
+    return next(reversed(results.values())).output if results else ""
+
+
+def _levels_completed(results: dict[str, AgentResult]) -> int:
+    """How many DAG levels produced results (``AgentResult.level`` is 0-indexed)."""
+    return max((r.level for r in results.values()), default=-1) + 1
+
+
+def _is_real_failure(task: asyncio.Task[AgentResult]) -> bool:
+    """Whether *task* finished with an error that should stop its level."""
+    if task.cancelled():
+        return False
+    error = task.exception()
+    return error is not None and not isinstance(error, PauseExecution)
+
+
+async def _with_limit(
+    semaphore: asyncio.Semaphore | None,
+    start: Callable[[], Coroutine[Any, Any, AgentResult]],
+) -> AgentResult:
+    """Await the coroutine *start* produces, holding *semaphore* if configured.
+
+    Takes a factory rather than a coroutine so that a task cancelled while
+    queueing never creates one — an un-awaited coroutine is a RuntimeWarning
+    and a confusing traceback.
+    """
+    if semaphore is None:
+        return await start()
+    async with semaphore:
+        return await start()
 
 
 class _PipelineNode:
@@ -53,6 +153,9 @@ class Pipeline:
         retry_failed_agents: How many times to retry a failed agent (default 0).
         budget_usd: Optional hard cost ceiling for a single run. Checked after
             each DAG level; exceeding it raises BudgetExceededError.
+        max_concurrency: Maximum agents in flight at once, across the whole
+            run. Without it a level of 40 agents opens 40 concurrent LLM
+            calls. ``None`` (default) means the level width is the only limit.
 
     Usage:
         pipe = Pipeline(llm=llm)
@@ -71,7 +174,13 @@ class Pipeline:
         session_id: str | None = None,
         approval_policy: ApprovalPolicy | None = None,
         budget_usd: float | None = None,
+        max_concurrency: int | None = None,
     ):
+        if max_concurrency is not None and max_concurrency < 1:
+            raise PipelineError(
+                f"max_concurrency must be at least 1, got {max_concurrency}"
+            )
+        self._max_concurrency = max_concurrency
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
         self._hooks = hooks
@@ -93,7 +202,10 @@ class Pipeline:
 
         Args:
             agent: An @Agent-decorated function or BaseAgent subclass instance.
-            depends_on: List of agent names this agent depends on.
+            depends_on: List of agent names this agent depends on. Forward
+                references are allowed — the graph is validated when it is
+                resolved (``run``/``stream``/``explain``), not as you build it,
+                so you are not forced to topologically sort your own source.
             timeout: Max seconds this agent may run before AgentTimeoutError is raised.
             condition: Callable receiving current context dict; if it returns False
                        the agent is skipped (emits agent_skipped event).
@@ -106,12 +218,6 @@ class Pipeline:
             raise PipelineError(f"Duplicate agent name: '{name}'")
 
         deps = depends_on or []
-        for dep in deps:
-            if dep not in self._agent_names:
-                raise PipelineError(
-                    f"Agent '{name}' depends on '{dep}', but '{dep}' hasn't been added yet"
-                )
-
         self._nodes.append(_PipelineNode(agent, deps, timeout=timeout, condition=condition))
         self._agent_names.add(name)
         return self
@@ -127,6 +233,18 @@ class Pipeline:
             writer (depends on both)           -> Level 1
         """
         node_map = {n.agent.name: n for n in self._nodes}
+
+        # Dependencies are validated here rather than in add() so that a node
+        # may name an agent added after it.
+        for node in self._nodes:
+            unknown = sorted(d for d in node.depends_on if d not in node_map)
+            if unknown:
+                raise PipelineError(
+                    f"Agent '{node.agent.name}' depends on unknown agent(s): "
+                    f"{', '.join(unknown)}. "
+                    f"Agents in this pipeline: {', '.join(sorted(node_map)) or '(none)'}"
+                )
+
         # Build in-degree count
         in_degree: dict[str, int] = {n.agent.name: 0 for n in self._nodes}
         dependents: dict[str, list[str]] = {n.agent.name: [] for n in self._nodes}
@@ -162,6 +280,51 @@ class Pipeline:
             )
 
         return levels
+
+    def explain(self) -> str:
+        """Describe the resolved DAG without running it or calling any LLM.
+
+        Answers "why did my agents run in that order" — and, because it
+        resolves the graph, fails on a cycle or an unknown dependency the same
+        way :meth:`run` would. Cheap enough to assert on in a test.
+
+        Returns:
+            A multi-line description; print it or log it.
+
+        Example::
+
+            >>> print(pipe.explain())
+            Pipeline: 3 agents, 2 levels, max 2 concurrent
+            Level 0 (2 agents, run in parallel):
+              researcher    role=Research Analyst
+              fact_checker  role=Fact Checker
+            Level 1 (1 agent):
+              writer        role=Content Writer  after=[fact_checker, researcher]
+        """
+        levels = self._resolve_levels()
+        widest = max((len(lvl) for lvl in levels), default=0)
+        cap = self._max_concurrency or widest
+        lines = [
+            f"Pipeline: {len(self._nodes)} agents, {len(levels)} levels, "
+            f"max {min(cap, widest) if widest else 0} concurrent"
+        ]
+
+        for index, level in enumerate(levels):
+            count = len(level)
+            suffix = ", run in parallel" if count > 1 else ""
+            lines.append(f"Level {index} ({count} agent{'s' if count != 1 else ''}{suffix}):")
+            width = max(len(n.agent.name) for n in level)
+            for node in level:
+                parts = [f"  {node.agent.name.ljust(width)}  role={node.agent.role}"]
+                if node.depends_on:
+                    parts.append(f"after=[{', '.join(sorted(node.depends_on))}]")
+                if node.timeout is not None:
+                    parts.append(f"timeout={node.timeout}s")
+                if node.condition is not None:
+                    parts.append("conditional (may be skipped at run time)")
+                lines.append("  ".join(parts))
+
+        return "\n".join(lines)
 
     async def _execute_node(
         self,
@@ -280,6 +443,7 @@ class Pipeline:
     ) -> PipelineResult:
         """Build the final PipelineResult (``paused`` when *pause* is given)."""
         return PipelineResult(
+            unpriced_models=_unpriced_models_used(results),
             output=last_output,
             results=results,
             total_tokens=sum(r.tokens_used for r in results.values()),
@@ -331,6 +495,15 @@ class Pipeline:
             a pause (the pause can simply trigger again on a re-run).
         """
         last_output = ""
+        # Per-run, not per-pipeline: two concurrent runs of the same Pipeline
+        # (as serve() dispatches) each get their own budget of in-flight
+        # agents rather than contending for one shared pool.
+        semaphore = (
+            asyncio.Semaphore(self._max_concurrency)
+            if self._max_concurrency is not None
+            else None
+        )
+
         for level_index in range(start_level, len(levels)):
             # Filter out agents whose condition is not met
             to_run: list[_PipelineNode] = []
@@ -357,17 +530,21 @@ class Pipeline:
 
             # Build context scoped to each agent's declared dependencies
             level_coros = [
-                self._execute_node(
-                    node,
-                    task,
-                    {k: v for k, v in context.items() if k in node.depends_on},
-                    level_index,
-                    session_id,
+                _with_limit(
+                    semaphore,
+                    functools.partial(
+                        self._execute_node,
+                        node,
+                        task,
+                        {k: v for k, v in context.items() if k in node.depends_on},
+                        level_index,
+                        session_id,
+                    ),
                 )
                 for node in to_run
             ]
 
-            level_results = await asyncio.gather(*level_coros, return_exceptions=True)
+            level_results = await _gather_level(level_coros)
 
             first_error: tuple[_PipelineNode, BaseException] | None = None
             pause: PauseExecution | None = None
@@ -375,6 +552,10 @@ class Pipeline:
                 if isinstance(result, PauseExecution):
                     if pause is None:
                         pause = result
+                elif isinstance(result, asyncio.CancelledError):
+                    # Cancelled by the fail-fast above; the agent that actually
+                    # failed is another entry in this same list.
+                    continue
                 elif isinstance(result, BaseException) and first_error is None:
                     first_error = (node, result)
 
@@ -445,15 +626,27 @@ class Pipeline:
         if self._hooks is not None:
             safe_invoke(self._hooks, "on_pipeline_start", task, run_id, len(self._nodes))
 
-        last_output, pause, levels_executed = await self._run_levels(
-            levels=levels,
-            start_level=0,
-            task=task,
-            context=context,
-            results=results,
-            session_id=session_id,
-            run_id=run_id,
-        )
+        try:
+            last_output, pause, levels_executed = await self._run_levels(
+                levels=levels,
+                start_level=0,
+                task=task,
+                context=context,
+                results=results,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        except BudgetExceededError as exc:
+            # The completed levels have already been paid for; hand them back
+            # rather than making the ceiling destroy what it was protecting.
+            exc.partial_result = self._build_result(
+                last_output=_last_output_of(results),
+                results=results,
+                run_id=run_id,
+                levels_executed=_levels_completed(results),
+                wall_start=wall_start,
+            )
+            raise
 
         pipeline_result = self._build_result(
             last_output=last_output,
@@ -557,15 +750,25 @@ class Pipeline:
 
         # Continue with remaining pipeline levels (supports nested pauses).
         levels = self._resolve_levels()
-        tail_output, pause, levels_executed = await self._run_levels(
-            levels=levels,
-            start_level=current_level + 1,
-            task=task,
-            context=context,
-            results=results,
-            session_id=session_id,
-            run_id=run_id,
-        )
+        try:
+            tail_output, pause, levels_executed = await self._run_levels(
+                levels=levels,
+                start_level=current_level + 1,
+                task=task,
+                context=context,
+                results=results,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        except BudgetExceededError as exc:
+            exc.partial_result = self._build_result(
+                last_output=_last_output_of(results),
+                results=results,
+                run_id=run_id,
+                levels_executed=_levels_completed(results),
+                wall_start=wall_start,
+            )
+            raise
         last_output = tail_output or last_output
 
         if pause is not None:
@@ -637,6 +840,7 @@ class Pipeline:
                     wall_time=round(time.perf_counter() - wall_start, 3),
                     agents_completed=len(results),
                     levels_executed=len(levels),
+                    unpriced_models=_unpriced_models_used(results),
                 )
             except Exception as e:
                 emitter.emit("pipeline_error", error=str(e))

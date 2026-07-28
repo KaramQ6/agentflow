@@ -64,3 +64,7 @@ nav:
       - Cost & Streaming: guides/cost-streaming.md
       - Observability: guides/observability.md
   - API Reference: reference.md
+  - Decisions:
+      - Fail-fast DAG levels: adr/0001-fail-fast-dag-levels.md
+      - Structured output: adr/0002-structured-output-via-prompt-and-repair.md
+      - Unpriced models: adr/0003-unpriced-models-report-zero-loudly.md

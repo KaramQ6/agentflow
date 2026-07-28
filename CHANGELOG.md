@@ -7,6 +7,94 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+---
+
+## [0.7.0] — 2026-07-29
+
+Correctness and honesty release. Three things this fixes were actively
+misleading: cost tracking reported `$0.00` on the provider the quickstart
+recommends, two shipped examples could not run at all, and the coverage gate
+claimed 90% while the suite measured 78%.
+
+**Upgrading.** Two behaviour changes are worth reading before you take this:
+
+- A failing DAG level now cancels its remaining agents. If you relied on
+  siblings completing after a failure, they no longer will — their results were
+  discarded anyway.
+- `pipe.add(agent, depends_on=["not_added_yet"])` no longer raises inside
+  `add()`. Unknown dependencies raise when the graph is resolved
+  (`run`/`stream`/`explain`). If you asserted on that early error, move the
+  assertion.
+
+`agentflow.distillation` is gone. It was never exported; if you imported it by
+path, pin `0.6.1` or lift the module out of git history.
+
+### Added
+- **Cost visibility for unpriced models.** A model with no pricing entry still
+  costs `$0.00`, but it is no longer silent: it is logged once per process, and
+  `PipelineResult.unpriced_models` lists every model in a run whose cost is a
+  placeholder. Priced the providers the docs actually recommend — Groq
+  (llama/gemma), DeepSeek, Mistral, `claude-3-7-sonnet` — which previously all
+  reported `total_cost: $0.000000`. See ADR 0003.
+- **`BudgetExceededError.partial_result`** — the agents that completed before
+  the ceiling tripped, instead of losing work already paid for.
+- **Structured output that repairs itself.** `output_schema` now sends the JSON
+  Schema to the model and, on a validation failure, shows it the errors and
+  asks for a correction (`@Agent(output_retries=1)` by default, `0` disables).
+  Repairs are billed to the agent and the budget. Markdown-fenced JSON is
+  unwrapped locally rather than costing a round-trip. See ADR 0002.
+- **`LLM.generate(**extra)`** — forwards any keyword to the provider (`seed`,
+  `top_p`, `stop`, `response_format`, `extra_body`). Included in the cache key.
+- **`Pipeline.explain()`** — renders the resolved DAG (levels, parallelism,
+  dependencies, timeouts, conditional nodes) without running anything.
+- **`Pipeline(max_concurrency=...)`** — caps agents in flight per run.
+- **`scripts/check_sdist.py`** — fail-closed allowlist for source-distribution
+  contents, the gate that was missing when 0.6.0 leaked a local directory.
+- Tests for `contrib.otel` and the whole MQTT surface, which had none.
+
+### Changed
+- **A failing DAG level cancels its remaining agents** instead of waiting for
+  them to finish producing output that is discarded anyway. A `PauseExecution`
+  is control flow and still lets its siblings complete. See ADR 0001.
+- **`depends_on` accepts forward references.** Unknown names now raise when the
+  graph is resolved (`run`/`stream`/`explain`) rather than inside `add()`, so
+  you are not forced to topologically sort your own source file. The message
+  lists the agents that do exist.
+- `ResponseCache.make_key()` takes an `extra` keyword so provider-specific
+  parameters cannot collide in the cache.
+- Trigger policies and `MQTTDaemon` moved from `agentflow.events` to
+  `agentflow.triggers`, next to `BaseTrigger`/`MQTTTrigger`. `events` is now
+  just the pipeline event emitter. These names were never exported.
+- CI installs the `otel` and `mqtt` extras and builds the docs with
+  `--strict`; `sandbox.py` is excluded from the coverage gate because its main
+  paths need a live Docker daemon. Coverage is 93% against a 90% gate (it was
+  78%, i.e. the gate would have failed the moment CI ran).
+
+### Fixed
+- **Two broken examples.** `robotics_mqtt_agent.py` and
+  `drone_telemetry_agent.py` used `@Agent(timeout=)`, `LLM(provider=)` and
+  `hooks=PipelineLogger(...)` — none of which exist — and imported a name
+  dropped in 0.6. `tests/test_examples.py` now imports every example in CI.
+- **`MQTTDaemon` busy-loop.** A cleanly-ended message stream caused an
+  immediate reconnect with no await, spinning the loop and starving the event
+  loop. A clean end now backs off like a dropped connection.
+- **`PydanticTriggerPolicy` prompt crash.** The `KeyError` fallback in
+  `build_task_prompt()` re-raised the same `KeyError`, and a payload model with
+  a `data` field raised `TypeError`. Templates now render leniently: an unknown
+  placeholder is left visible and logged instead of killing the daemon.
+- Abandoning a `stream()` generator now cancels the agents still in flight.
+
+### Removed
+- **`agentflow.distillation`** and the `InMemoryContext.enable_distillation()`
+  hook it served. 160 lines with no tests, no coverage, no export and no docs —
+  unreachable without importing a private module. Recoverable from git history
+  if it is ever wanted back, with tests. `swarm_routing.py` is also unexported
+  but is 92% covered, so it stays and is now documented as an opt-in module.
+
+---
+
 ## [0.6.1] — 2026-07-16
 
 Packaging-hygiene release. **0.6.0 has been yanked from PyPI.** Its source

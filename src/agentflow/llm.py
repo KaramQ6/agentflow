@@ -12,7 +12,7 @@ from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 
 from .exceptions import LLMError
-from .pricing import estimate_cost
+from .pricing import estimate_cost, warn_if_unpriced
 from .types import LLMResponse
 
 if TYPE_CHECKING:
@@ -77,6 +77,7 @@ class LLM:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
+        **extra: Any,
     ) -> LLMResponse:
         """Generate a completion from the LLM.
 
@@ -89,6 +90,13 @@ class LLM:
                 provided the response may contain ``tool_calls`` and the cache is
                 bypassed (tools may have side effects).
             tool_choice: Optional OpenAI ``tool_choice`` ("auto", "none", etc.).
+            **extra: Passed straight through to the provider's chat-completions
+                call. The escape hatch for anything agentflow does not model —
+                ``seed``, ``top_p``, ``stop``, ``response_format``,
+                ``extra_body``. agentflow never sets these itself: a
+                provider-native ``response_format`` is not portable across every
+                OpenAI-compatible endpoint, so opting in is your call. These
+                values are part of the cache key.
 
         Returns:
             An :class:`~agentflow.types.LLMResponse`. Dict-style access
@@ -106,6 +114,7 @@ class LLM:
                 effective_model,
                 temperature=temperature if temperature is not None else self.temperature,
                 max_tokens=max_tokens or self.max_tokens,
+                extra=extra or None,
             )
             cached = await self._cache.get(cache_key)
             if cached is not None:
@@ -116,10 +125,10 @@ class LLM:
         start = time.perf_counter()
         last_error: Exception | None = None
 
-        extra: dict[str, Any] = {}
+        params: dict[str, Any] = dict(extra)
         if tools:
-            extra["tools"] = tools
-            extra["tool_choice"] = tool_choice or "auto"
+            params["tools"] = tools
+            params["tool_choice"] = tool_choice or "auto"
 
         for attempt in range(self.max_retries + 1):
             # Rate limiting per attempt; acquire outside the try so a failed
@@ -132,13 +141,17 @@ class LLM:
                     messages=cast("list[ChatCompletionMessageParam]", messages),
                     temperature=temperature if temperature is not None else self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
-                    **extra,
+                    **params,
                 )
                 duration = time.perf_counter() - start
                 choice = response.choices[0]
                 usage = response.usage
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
+
+                # The response's model id is the one that was actually billed —
+                # providers routinely return a more specific id than requested.
+                warn_if_unpriced(response.model)
 
                 result = LLMResponse(
                     content=choice.message.content or "",

@@ -29,13 +29,14 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agentflow import LLM, Agent, MQTTTrigger, Pipeline, PipelineLogger
+from agentflow import LLM, Agent, LoggingHooks, Pipeline
+from agentflow.triggers import MQTTTrigger
 from agentflow.types import PipelineResult
 
 # ─── Agents ──────────────────────────────────────────────────────────────────────
 
 
-@Agent(name="sensor_analyzer", role="IoT Sensor Analyst", timeout=30)
+@Agent(name="sensor_analyzer", role="IoT Sensor Analyst")
 async def sensor_analyzer(task: str, context: dict) -> str:
     return (
         f"You are an industrial IoT sensor analyst.  Examine the following "
@@ -47,7 +48,7 @@ async def sensor_analyzer(task: str, context: dict) -> str:
     )
 
 
-@Agent(name="diagnostic_agent", role="Robotics Diagnostics Specialist", timeout=30)
+@Agent(name="diagnostic_agent", role="Robotics Diagnostics Specialist")
 async def diagnostic_agent(task: str, context: dict) -> str:
     analyzer_output = context.get("sensor_analyzer", "")
     return (
@@ -75,32 +76,38 @@ def anomaly_detected(context: dict[str, str]) -> bool:
 async def main():
     llm = LLM(
         model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        provider="groq",
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.environ.get("GROQ_API_KEY"),
     )
 
-    pipe = Pipeline(
-        llm=llm,
-        hooks=PipelineLogger(verbose=True),
+    pipe = Pipeline(llm=llm, hooks=LoggingHooks("robotics-mqtt"))
+    pipe.add(sensor_analyzer, timeout=30)
+    pipe.add(
+        diagnostic_agent,
+        depends_on=["sensor_analyzer"],
+        timeout=30,
+        condition=anomaly_detected,
     )
-    pipe.add(sensor_analyzer)
-    pipe.add(diagnostic_agent, depends_on=["sensor_analyzer"], condition=anomaly_detected)
 
+    broker = os.environ.get("MQTT_BROKER", "localhost")
+    port = int(os.environ.get("MQTT_PORT", "1883"))
+    topic = os.environ.get("MQTT_TOPIC", "factory/+/sensors")
     trigger = MQTTTrigger(
-        broker=os.environ.get("MQTT_BROKER", "localhost"),
-        port=int(os.environ.get("MQTT_PORT", "1883")),
-        topic=os.environ.get("MQTT_TOPIC", "factory/+/sensors"),
+        broker=broker,
+        port=port,
+        topic=topic,
         prompt_template="Analyze this sensor data: {data}",
     )
 
     def on_done(result: PipelineResult) -> None:
         print(f"\n{'='*60}")
         print(f"Run {result.run_id} completed | {result.total_tokens} tokens | "
-              f"{result.total_duration:.2f}s")
+              f"{result.wall_time:.2f}s")
         for name, ar in result.results.items():
             print(f"  [{name}] {ar.output[:120]}...")
         print(f"{'='*60}")
 
-    print(f"Listening on MQTT broker {trigger._broker}:{trigger._port} [{trigger._topic}]")
+    print(f"Listening on MQTT broker {broker}:{port} [{topic}]")
     print("Publish a JSON payload to trigger the pipeline. Press Ctrl+C to stop.\n")
 
     await pipe.serve(

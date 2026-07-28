@@ -112,6 +112,12 @@ class PipelineResult(BaseModel):
     agents_with_cache_hits: int = 0
     status: Literal["completed", "paused"] = "completed"
     pause_info: dict[str, Any] | None = None
+    unpriced_models: list[str] = Field(default_factory=list)
+    """Models used in this run that have no entry in the pricing table.
+
+    Their contribution to :attr:`total_cost` is ``0.0`` — a placeholder, not a
+    measurement. A non-empty list means ``total_cost`` is an undercount. Fix it
+    with :func:`agentflow.register_price`."""
 
     @property
     def agent_seconds(self) -> float:

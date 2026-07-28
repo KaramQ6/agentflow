@@ -6,7 +6,7 @@ opt-in submodules and are NOT re-exported here:
 
 - ``agentflow.sandbox``   — Docker/subprocess code-execution sandboxes
 - ``agentflow.triggers``  — event-driven daemon triggers (MQTT)
-- ``agentflow.distillation`` — background memory compression
+- ``agentflow.swarm_routing`` — depth-capped delegating supervisor
 
 See PUBLIC_API.md for the stability contract.
 """
