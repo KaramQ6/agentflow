@@ -80,7 +80,16 @@ exclude = ["examples/"]
 
 [tool.coverage.run]
 source = ["agentflow"]
-omit = ["*/tests/*", "*/examples/*"]
+omit = [
+    "*/tests/*",
+    "*/examples/*",
+    # Needs a live Docker daemon to exercise its main paths; tests/test_sandbox.py
+    # skips without one. Measuring it here would make the gate report on the
+    # runner's environment rather than on the code, and a green CI box would
+    # mean "Docker was absent" instead of "this is covered". Reviewed on its
+    # own — it is the package's largest security surface.
+    "*/agentflow/sandbox.py",
+]
 
 [tool.coverage.report]
 show_missing = true
