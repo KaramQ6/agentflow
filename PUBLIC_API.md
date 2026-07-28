@@ -42,8 +42,12 @@ Importable by full path, excluded from the stability contract:
 
 - `agentflow.sandbox` — code-execution sandboxes (this is a security
   surface; review it before use)
-- `agentflow.triggers` — event-driven daemon triggers (MQTT)
-- `agentflow.distillation` — background memory compression
+- `agentflow.triggers` — event-driven triggers and the MQTT daemon
+  (`BaseTrigger`, `MQTTTrigger`, `TriggerPolicy`, `PydanticTriggerPolicy`,
+  `MQTTDaemon`)
+- `agentflow.swarm_routing` — `DynamicSupervisorAgent`, a supervisor with
+  Pydantic-generated delegation schemas, strict worker context isolation and
+  depth-capped delegation
 - `agentflow.contrib.*` — third-party bridges (e.g. `contrib.otel.OTelHooks`)
 
 ## Current deprecations

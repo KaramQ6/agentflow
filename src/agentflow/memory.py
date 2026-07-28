@@ -17,12 +17,9 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .exceptions import AgentFlowError
-
-if TYPE_CHECKING:
-    from .distillation import ContextDistiller
 
 _log = logging.getLogger("agentflow.memory")
 
@@ -74,23 +71,6 @@ class InMemoryContext(BaseMemory):
         self._max_sessions = max_sessions
         self._store: OrderedDict[str, OrderedDict[str, tuple[Any, float]]] = OrderedDict()
         self._lock = asyncio.Lock()
-        self._session_versions: dict[str, int] = {}
-        self._distiller: ContextDistiller | None = None
-
-    def enable_distillation(
-        self, distiller: ContextDistiller, threshold_tokens: int = 4000
-    ) -> None:
-        """Enable background context distillation for this memory store.
-
-        When enabled, every :meth:`save_context` call checks whether the
-        session's token count exceeds *threshold_tokens* and triggers
-        distillation as a non-blocking background task.
-
-        Args:
-            distiller: A configured :class:`~agentflow.distillation.ContextDistiller`.
-            threshold_tokens: Token threshold above which distillation fires.
-        """
-        self._distiller = distiller
 
     async def save_context(self, session_id: str, key: str, value: Any) -> None:
         expiry = time.monotonic() + self._default_ttl
@@ -112,12 +92,6 @@ class InMemoryContext(BaseMemory):
                 oldest_sid = next(iter(self._store))
                 del self._store[oldest_sid]
                 _log.debug("LRU evicted session %s", oldest_sid)
-            # Version counter for distillation concurrency safety.
-            self._session_versions[session_id] = self._session_versions.get(session_id, 0) + 1
-
-        # Trigger background distillation without blocking the caller.
-        if self._distiller is not None:
-            asyncio.create_task(self._distiller.maybe_distill(session_id))
 
     async def load_context(self, session_id: str) -> dict[str, Any]:
         now = time.monotonic()
@@ -149,85 +123,6 @@ class InMemoryContext(BaseMemory):
                     del self._store[session_id]
                 else:
                     self._store.move_to_end(session_id)
-
-    async def _get_session_snapshot(
-        self, session_id: str
-    ) -> tuple[dict[str, Any], int] | None:
-        """Return a snapshot of *session_id* content plus its version counter.
-
-        Called by :class:`~agentflow.distillation.ContextDistiller` under
-        the memory lock.  Returns ``None`` if the session is empty or missing.
-        """
-        now = time.monotonic()
-        async with self._lock:
-            session = self._store.get(session_id)
-            if session is None:
-                return None
-            content: dict[str, Any] = {}
-            for k, (v, exp) in session.items():
-                if now < exp:
-                    content[k] = v
-            if not content:
-                return None
-            version = self._session_versions.get(session_id, 0)
-            # Return a deep-enough copy: dict and shallow values are fine.
-            return dict(content), version
-
-    async def _replace_distilled(
-        self,
-        session_id: str,
-        expected_content: dict[str, Any],
-        version: int,
-        distilled: str,
-    ) -> bool:
-        """Atomically replace session content with *distilled* if unchanged.
-
-        Called by :class:`~agentflow.distillation.ContextDistiller` after the
-        LLM call completes.  Compares the current session content and version
-        against the snapshot.  If any key was added, modified, or deleted
-        during the distillation call, the replacement is skipped.
-
-        Returns:
-            ``True`` if the replacement succeeded, ``False`` if the session
-            was modified concurrently.
-        """
-        async with self._lock:
-            current_version = self._session_versions.get(session_id, 0)
-            if current_version != version:
-                _log.debug(
-                    "Distillation replacement skipped for %s: "
-                    "version mismatch (%d != %d)",
-                    session_id, current_version, version,
-                )
-                return False
-
-            session = self._store.get(session_id)
-            if session is None:
-                return False
-
-            now = time.monotonic()
-            current_content: dict[str, Any] = {}
-            for k, (v, exp) in session.items():
-                if now < exp:
-                    current_content[k] = v
-
-            if current_content != expected_content:
-                _log.debug(
-                    "Distillation replacement skipped for %s: content changed",
-                    session_id,
-                )
-                return False
-
-            # Atomically replace: clear session, store distilled result.
-            expiry = time.monotonic() + self._default_ttl
-            session.clear()
-            session["_distilled"] = (distilled, expiry)
-            self._session_versions[session_id] = version + 1
-            _log.debug(
-                "Distillation stored for session %s (%d chars)",
-                session_id, len(distilled),
-            )
-            return True
 
 
 # ── Optional dependency guards ────────────────────────────────────────────────
