@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import warnings
@@ -24,6 +25,7 @@ TOOL_OUTPUT_MAX_CHARS = 5000
 MESSAGES_MAX_LENGTH = 20
 LLM_RETRIES_PER_ITERATION = 1
 MEMORY_SNIPPET_MAX_CHARS = 300
+DEFAULT_OUTPUT_RETRIES = 1
 
 _log = logging.getLogger("agentflow.agent")
 
@@ -33,6 +35,36 @@ def _truncate_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str
     if len(output) <= max_chars:
         return output
     return output[:max_chars] + f"...[Truncated: {len(output) - max_chars} chars]"
+
+
+def _strip_json_fence(content: str) -> str:
+    """Drop a surrounding markdown code fence from *content*.
+
+    Wrapping JSON in ```json fences is the most common way a model breaks a
+    "JSON only" instruction. Fixing it locally is free; letting it through
+    would spend a whole repair round-trip on a formatting artefact. Anything
+    beyond a fence (JSON buried in prose) is left alone — guessing where the
+    object starts is how you silently validate the wrong thing.
+    """
+    text = content.strip()
+    if not text.startswith("```"):
+        return content
+    text = text[3:]
+    if text[:4].lower() == "json":
+        text = text[4:]
+    closing = text.rfind("```")
+    if closing != -1:
+        text = text[:closing]
+    return text.strip()
+
+
+def _schema_instruction(schema: type[BaseModel]) -> str:
+    """The system-prompt block telling the model what shape to answer in."""
+    return (
+        "\n\nRespond with a single JSON object and nothing else — no prose, no "
+        "markdown fences. It must validate against this JSON Schema:\n"
+        + json.dumps(schema.model_json_schema())
+    )
 
 
 class BaseAgent(ABC):
@@ -82,6 +114,7 @@ class AgentSpec:
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         memory: BaseMemory | None = None,
         system_prompt: str | None = None,
+        output_retries: int = DEFAULT_OUTPUT_RETRIES,
     ):
         self.name = name
         self.role = role
@@ -91,6 +124,7 @@ class AgentSpec:
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
         self._system_prompt = system_prompt
+        self._output_retries = output_retries
         self._session_id = "default"
         self._approval_policy: ApprovalPolicy | None = None
         # Tool schemas are static per agent — compute them once, not per call.
@@ -166,6 +200,10 @@ class AgentSpec:
                     + "\n]"
                 )
 
+        # Last, so the format contract is the final thing the model reads.
+        if self._output_schema is not None:
+            system_prompt += _schema_instruction(self._output_schema)
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -197,12 +235,14 @@ class AgentSpec:
 
         data: dict[str, Any] | None = None
         if self._output_schema is not None:
-            try:
-                validated = self._output_schema.model_validate_json(content)
-                data = validated.model_dump()
-                metadata["validated_output"] = data
-            except ValidationError as e:
-                raise AgentOutputValidationError(self.name, str(e)) from e
+            data, content, repair_tokens, repair_cost = await self._validate_output(
+                content, messages, llm
+            )
+            metadata["validated_output"] = data
+            tokens_used += repair_tokens
+            cost += repair_cost
+            if repair_tokens:
+                cached = False  # a repair round-trip means this was not a pure cache hit
 
         duration = time.perf_counter() - start
         return AgentResult(
@@ -215,6 +255,69 @@ class AgentSpec:
             metadata=metadata,
             data=data,
         )
+
+    async def _validate_output(
+        self, content: str, messages: list[dict[str, Any]], llm: LLM
+    ) -> tuple[dict[str, Any], str, int, float]:
+        """Validate *content* against ``output_schema``, re-asking on failure.
+
+        A single malformed response used to kill the whole run. The model is
+        instead shown its own output and the validation errors and asked to
+        correct itself, up to ``output_retries`` times — the same self-repair
+        loop instructor and PydanticAI make standard. Repairs cost tokens, so
+        they are counted into the agent's usage and the run's budget.
+
+        Returns:
+            ``(validated_data, final_content, repair_tokens, repair_cost)``.
+
+        Raises:
+            AgentOutputValidationError: The last attempt still failed to validate.
+        """
+        assert self._output_schema is not None
+        repair_tokens = 0
+        repair_cost = 0.0
+        attempts = max(self._output_retries, 0) + 1
+        conversation = messages
+
+        for attempt in range(attempts):
+            try:
+                validated = self._output_schema.model_validate_json(
+                    _strip_json_fence(content)
+                )
+                return validated.model_dump(), content, repair_tokens, repair_cost
+            except ValidationError as error:
+                if attempt == attempts - 1:
+                    raise AgentOutputValidationError(self.name, str(error)) from error
+
+                _log.warning(
+                    "Output schema validation failed in agent %s (attempt %d/%d); "
+                    "asking the model to correct it",
+                    self.name, attempt + 1, attempts,
+                )
+                # A fresh list per attempt: the caller's messages must not grow
+                # a repair transcript as a side effect.
+                conversation = [
+                    *conversation,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "That response did not validate against the required "
+                            f"JSON Schema. Errors:\n{error}\n\n"
+                            "Reply with corrected JSON only — no prose, no markdown "
+                            "fences."
+                        ),
+                    },
+                ]
+                try:
+                    response = await llm.generate(conversation)
+                except Exception as exc:
+                    raise AgentError(self.name, str(exc)) from exc
+                content = response.content
+                repair_tokens += response.tokens
+                repair_cost += response.cost
+
+        raise AgentError(self.name, "output validation loop exited without a result")
 
     async def _run_tool_loop(
         self,
@@ -537,12 +640,12 @@ class AgentSpec:
         }
         data: dict[str, Any] | None = None
         if self._output_schema is not None:
-            try:
-                validated = self._output_schema.model_validate_json(content)
-            except Exception as e:
-                raise AgentOutputValidationError(self.name, str(e)) from e
-            data = validated.model_dump()
+            data, content, repair_tokens, repair_cost = await self._validate_output(
+                content, messages, llm
+            )
             metadata["validated_output"] = data
+            total_tokens += repair_tokens
+            total_cost += repair_cost
 
         duration = time.perf_counter() - start
         return AgentResult(
@@ -569,9 +672,17 @@ class Agent:
     Args:
         name: Unique identifier for the agent within a pipeline.
         role: Describes the agent's persona (used as system prompt context).
-        output_schema: Optional Pydantic BaseModel subclass. If provided, the
-                       LLM response must be valid JSON matching the schema, or
-                       AgentOutputValidationError is raised.
+        output_schema: Optional Pydantic BaseModel subclass. When provided, the
+                       schema is appended to the system prompt so the model
+                       knows the shape to produce, its reply is validated
+                       against it, and the validated dict is what downstream
+                       agents receive in ``context``. You do not need to embed
+                       the schema in your prompt yourself.
+        output_retries: How many times to show the model its validation errors
+                        and ask it to correct itself before raising
+                        AgentOutputValidationError (default 1; 0 disables).
+                        Each repair is a real LLM call and is billed to the
+                        agent's tokens, cost, and the pipeline budget.
         tools: Optional list of ``Tool`` objects (see :func:`agentflow.tool`).
                When present the agent runs a ReAct loop, letting the model call
                tools and observe results until it produces a final answer.
@@ -615,6 +726,7 @@ class Agent:
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         memory: BaseMemory | None = None,
         system_prompt: str | None = None,
+        output_retries: int = DEFAULT_OUTPUT_RETRIES,
     ):
         self.name = name
         self.role = role
@@ -623,6 +735,7 @@ class Agent:
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
         self._system_prompt = system_prompt
+        self._output_retries = output_retries
 
     def __call__(self, fn: Callable[..., Awaitable[str]]) -> AgentSpec:
         return AgentSpec(
@@ -634,6 +747,7 @@ class Agent:
             max_tool_iterations=self._max_tool_iterations,
             memory=self._memory,
             system_prompt=self._system_prompt,
+            output_retries=self._output_retries,
         )
 
 

@@ -34,11 +34,16 @@ class ResponseCache(ABC):
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        extra: dict[str, Any] | None = None,
     ) -> str:
-        """Deterministic SHA-256 cache key from messages + sampling parameters.
+        """Deterministic SHA-256 cache key from messages + request parameters.
 
         Temperature and max_tokens are part of the key so requests that differ
-        only in sampling settings never collide.
+        only in sampling settings never collide. *extra* covers provider-specific
+        parameters passed through :meth:`agentflow.LLM.generate` (``seed``,
+        ``response_format``, ...) — a request asking for JSON must not be served
+        the cached prose answer to the same messages.
         """
         payload = json.dumps(
             {
@@ -46,6 +51,7 @@ class ResponseCache(ABC):
                 "model": model,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "extra": extra or {},
             },
             sort_keys=True,
             default=str,
