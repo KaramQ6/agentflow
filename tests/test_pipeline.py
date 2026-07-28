@@ -63,13 +63,41 @@ def test_pipeline_duplicate_name_raises():
         pipe.add(a2)
 
 
-def test_pipeline_missing_dependency_raises():
-    llm = MockLLM()
-    pipe = Pipeline(llm=llm)
-    a1 = SimpleAgent("agent1")
+def test_unknown_dependency_raises_when_the_graph_is_resolved():
+    """Validation moved from add() to resolution, so forward refs are legal."""
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(SimpleAgent("agent1"), depends_on=["nonexistent"])  # accepted here
 
-    with pytest.raises(PipelineError, match="hasn't been added"):
-        pipe.add(a1, depends_on=["nonexistent"])
+    with pytest.raises(PipelineError) as exc_info:
+        pipe._resolve_levels()
+
+    message = str(exc_info.value)
+    assert "nonexistent" in message
+    assert "agent1" in message
+
+
+def test_forward_references_are_allowed():
+    """A node may depend on an agent added after it."""
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(SimpleAgent("writer"), depends_on=["researcher"])
+    pipe.add(SimpleAgent("researcher"))
+
+    levels = pipe._resolve_levels()
+
+    assert [n.agent.name for n in levels[0]] == ["researcher"]
+    assert [n.agent.name for n in levels[1]] == ["writer"]
+
+
+@pytest.mark.asyncio
+async def test_forward_referenced_pipeline_runs_in_dependency_order():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(SimpleAgent("writer"), depends_on=["researcher"])
+    pipe.add(SimpleAgent("researcher"))
+
+    result = await pipe.run("task")
+
+    assert result.results["researcher"].level == 0
+    assert result.results["writer"].level == 1
 
 
 def test_pipeline_chaining():
@@ -227,8 +255,7 @@ def test_cycle_error_names_members():
     pipe = Pipeline(llm=MockLLM())
     pipe.add(SimpleAgent("alpha"))
     pipe.add(SimpleAgent("beta"), depends_on=["alpha"])
-    # Forge a cycle directly — add() forbids forward references.
-    pipe._nodes[0].depends_on = ["beta"]
+    pipe._nodes[0].depends_on = ["beta"]  # alpha <-> beta
 
     with pytest.raises(PipelineError) as exc_info:
         pipe._resolve_levels()

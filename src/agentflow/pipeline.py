@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import time
@@ -110,6 +111,22 @@ def _is_real_failure(task: asyncio.Task[AgentResult]) -> bool:
     return error is not None and not isinstance(error, PauseExecution)
 
 
+async def _with_limit(
+    semaphore: asyncio.Semaphore | None,
+    start: Callable[[], Coroutine[Any, Any, AgentResult]],
+) -> AgentResult:
+    """Await the coroutine *start* produces, holding *semaphore* if configured.
+
+    Takes a factory rather than a coroutine so that a task cancelled while
+    queueing never creates one — an un-awaited coroutine is a RuntimeWarning
+    and a confusing traceback.
+    """
+    if semaphore is None:
+        return await start()
+    async with semaphore:
+        return await start()
+
+
 class _PipelineNode:
     """Internal node in the pipeline graph."""
 
@@ -136,6 +153,9 @@ class Pipeline:
         retry_failed_agents: How many times to retry a failed agent (default 0).
         budget_usd: Optional hard cost ceiling for a single run. Checked after
             each DAG level; exceeding it raises BudgetExceededError.
+        max_concurrency: Maximum agents in flight at once, across the whole
+            run. Without it a level of 40 agents opens 40 concurrent LLM
+            calls. ``None`` (default) means the level width is the only limit.
 
     Usage:
         pipe = Pipeline(llm=llm)
@@ -154,7 +174,13 @@ class Pipeline:
         session_id: str | None = None,
         approval_policy: ApprovalPolicy | None = None,
         budget_usd: float | None = None,
+        max_concurrency: int | None = None,
     ):
+        if max_concurrency is not None and max_concurrency < 1:
+            raise PipelineError(
+                f"max_concurrency must be at least 1, got {max_concurrency}"
+            )
+        self._max_concurrency = max_concurrency
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
         self._hooks = hooks
@@ -176,7 +202,10 @@ class Pipeline:
 
         Args:
             agent: An @Agent-decorated function or BaseAgent subclass instance.
-            depends_on: List of agent names this agent depends on.
+            depends_on: List of agent names this agent depends on. Forward
+                references are allowed — the graph is validated when it is
+                resolved (``run``/``stream``/``explain``), not as you build it,
+                so you are not forced to topologically sort your own source.
             timeout: Max seconds this agent may run before AgentTimeoutError is raised.
             condition: Callable receiving current context dict; if it returns False
                        the agent is skipped (emits agent_skipped event).
@@ -189,12 +218,6 @@ class Pipeline:
             raise PipelineError(f"Duplicate agent name: '{name}'")
 
         deps = depends_on or []
-        for dep in deps:
-            if dep not in self._agent_names:
-                raise PipelineError(
-                    f"Agent '{name}' depends on '{dep}', but '{dep}' hasn't been added yet"
-                )
-
         self._nodes.append(_PipelineNode(agent, deps, timeout=timeout, condition=condition))
         self._agent_names.add(name)
         return self
@@ -210,6 +233,18 @@ class Pipeline:
             writer (depends on both)           -> Level 1
         """
         node_map = {n.agent.name: n for n in self._nodes}
+
+        # Dependencies are validated here rather than in add() so that a node
+        # may name an agent added after it.
+        for node in self._nodes:
+            unknown = sorted(d for d in node.depends_on if d not in node_map)
+            if unknown:
+                raise PipelineError(
+                    f"Agent '{node.agent.name}' depends on unknown agent(s): "
+                    f"{', '.join(unknown)}. "
+                    f"Agents in this pipeline: {', '.join(sorted(node_map)) or '(none)'}"
+                )
+
         # Build in-degree count
         in_degree: dict[str, int] = {n.agent.name: 0 for n in self._nodes}
         dependents: dict[str, list[str]] = {n.agent.name: [] for n in self._nodes}
@@ -245,6 +280,51 @@ class Pipeline:
             )
 
         return levels
+
+    def explain(self) -> str:
+        """Describe the resolved DAG without running it or calling any LLM.
+
+        Answers "why did my agents run in that order" — and, because it
+        resolves the graph, fails on a cycle or an unknown dependency the same
+        way :meth:`run` would. Cheap enough to assert on in a test.
+
+        Returns:
+            A multi-line description; print it or log it.
+
+        Example::
+
+            >>> print(pipe.explain())
+            Pipeline: 3 agents, 2 levels, max 2 concurrent
+            Level 0 (2 agents, run in parallel):
+              researcher    role=Research Analyst
+              fact_checker  role=Fact Checker
+            Level 1 (1 agent):
+              writer        role=Content Writer  after=[fact_checker, researcher]
+        """
+        levels = self._resolve_levels()
+        widest = max((len(lvl) for lvl in levels), default=0)
+        cap = self._max_concurrency or widest
+        lines = [
+            f"Pipeline: {len(self._nodes)} agents, {len(levels)} levels, "
+            f"max {min(cap, widest) if widest else 0} concurrent"
+        ]
+
+        for index, level in enumerate(levels):
+            count = len(level)
+            suffix = ", run in parallel" if count > 1 else ""
+            lines.append(f"Level {index} ({count} agent{'s' if count != 1 else ''}{suffix}):")
+            width = max(len(n.agent.name) for n in level)
+            for node in level:
+                parts = [f"  {node.agent.name.ljust(width)}  role={node.agent.role}"]
+                if node.depends_on:
+                    parts.append(f"after=[{', '.join(sorted(node.depends_on))}]")
+                if node.timeout is not None:
+                    parts.append(f"timeout={node.timeout}s")
+                if node.condition is not None:
+                    parts.append("conditional (may be skipped at run time)")
+                lines.append("  ".join(parts))
+
+        return "\n".join(lines)
 
     async def _execute_node(
         self,
@@ -415,6 +495,15 @@ class Pipeline:
             a pause (the pause can simply trigger again on a re-run).
         """
         last_output = ""
+        # Per-run, not per-pipeline: two concurrent runs of the same Pipeline
+        # (as serve() dispatches) each get their own budget of in-flight
+        # agents rather than contending for one shared pool.
+        semaphore = (
+            asyncio.Semaphore(self._max_concurrency)
+            if self._max_concurrency is not None
+            else None
+        )
+
         for level_index in range(start_level, len(levels)):
             # Filter out agents whose condition is not met
             to_run: list[_PipelineNode] = []
@@ -441,12 +530,16 @@ class Pipeline:
 
             # Build context scoped to each agent's declared dependencies
             level_coros = [
-                self._execute_node(
-                    node,
-                    task,
-                    {k: v for k, v in context.items() if k in node.depends_on},
-                    level_index,
-                    session_id,
+                _with_limit(
+                    semaphore,
+                    functools.partial(
+                        self._execute_node,
+                        node,
+                        task,
+                        {k: v for k, v in context.items() if k in node.depends_on},
+                        level_index,
+                        session_id,
+                    ),
                 )
                 for node in to_run
             ]
