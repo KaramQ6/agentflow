@@ -12,7 +12,7 @@ from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 
 from .exceptions import LLMError
-from .pricing import estimate_cost
+from .pricing import estimate_cost, warn_if_unpriced
 from .types import LLMResponse
 
 if TYPE_CHECKING:
@@ -139,6 +139,10 @@ class LLM:
                 usage = response.usage
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
+
+                # The response's model id is the one that was actually billed —
+                # providers routinely return a more specific id than requested.
+                warn_if_unpriced(response.model)
 
                 result = LLMResponse(
                     content=choice.message.content or "",

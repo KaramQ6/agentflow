@@ -235,3 +235,62 @@ def test_cycle_error_names_members():
 
     assert "alpha" in str(exc_info.value)
     assert "beta" in str(exc_info.value)
+
+
+# ── Unpriced-model reporting ──────────────────────────────────────────────────
+
+
+class ModelStampedAgent(BaseAgent):
+    """Agent that reports which model produced its output, as real agents do."""
+
+    def __init__(self, name: str, model: str):
+        super().__init__(name=name, role="stamped")
+        self._model = model
+
+    async def execute(self, task, context, llm):
+        return AgentResult(agent=self.name, output="ok", metadata={"model": self._model})
+
+
+@pytest.mark.asyncio
+async def test_result_reports_models_whose_cost_is_a_placeholder():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(ModelStampedAgent("known", "gpt-4o-mini"))
+    pipe.add(ModelStampedAgent("unknown", "some-self-hosted-model"))
+
+    result = await pipe.run("task")
+
+    assert result.unpriced_models == ["some-self-hosted-model"]
+
+
+@pytest.mark.asyncio
+async def test_fully_priced_run_reports_no_unpriced_models():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(ModelStampedAgent("a", "gpt-4o-mini"))
+    pipe.add(ModelStampedAgent("b", "llama-3.3-70b-versatile"))
+
+    result = await pipe.run("task")
+
+    assert result.unpriced_models == []
+
+
+@pytest.mark.asyncio
+async def test_unpriced_models_are_deduplicated_and_sorted():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(ModelStampedAgent("a", "zeta-model"))
+    pipe.add(ModelStampedAgent("b", "alpha-model"))
+    pipe.add(ModelStampedAgent("c", "zeta-model"))
+
+    result = await pipe.run("task")
+
+    assert result.unpriced_models == ["alpha-model", "zeta-model"]
+
+
+@pytest.mark.asyncio
+async def test_stream_reports_unpriced_models_too():
+    pipe = Pipeline(llm=MockLLM())
+    pipe.add(ModelStampedAgent("a", "some-self-hosted-model"))
+
+    events = [e async for e in pipe.stream("task")]
+    complete = [e for e in events if e.type == "pipeline_complete"][0]
+
+    assert complete.data["unpriced_models"] == ["some-self-hosted-model"]

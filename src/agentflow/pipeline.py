@@ -19,12 +19,26 @@ from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
 from .memory import BaseMemory
 from .observability import Hooks, safe_invoke
+from .pricing import is_priced
 from .types import AgentResult, Event, PipelineResult
 
 if TYPE_CHECKING:
     from .triggers import BaseTrigger
 
 _logger = logging.getLogger(__name__)
+
+
+def _unpriced_models_used(results: dict[str, AgentResult]) -> list[str]:
+    """Models in *results* with no pricing entry, so their cost is a placeholder.
+
+    Sorted for a stable, comparable value.
+    """
+    models = {
+        model
+        for r in results.values()
+        if (model := r.metadata.get("model")) and not is_priced(model)
+    }
+    return sorted(models)
 
 
 class _PipelineNode:
@@ -280,6 +294,7 @@ class Pipeline:
     ) -> PipelineResult:
         """Build the final PipelineResult (``paused`` when *pause* is given)."""
         return PipelineResult(
+            unpriced_models=_unpriced_models_used(results),
             output=last_output,
             results=results,
             total_tokens=sum(r.tokens_used for r in results.values()),
@@ -637,6 +652,7 @@ class Pipeline:
                     wall_time=round(time.perf_counter() - wall_start, 3),
                     agents_completed=len(results),
                     levels_executed=len(levels),
+                    unpriced_models=_unpriced_models_used(results),
                 )
             except Exception as e:
                 emitter.emit("pipeline_error", error=str(e))
