@@ -7,23 +7,23 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-Lightweight multi-agent AI pipeline framework. Define agents with decorators, give them **tools**, wire them into a DAG, and run independent stages **in parallel** — with built-in cost tracking, caching, timeouts, streaming, and observability.
+Lightweight multi-agent AI pipeline framework. Define agents with decorators, give them **tools**, wire them into a DAG, and run independent stages **in parallel**, with built-in cost tracking, caching, timeouts, streaming, and observability.
 
-- **Tool / function calling** — `@tool` turns any Python function into an LLM tool; agents run a bounded ReAct loop
-- **Parallel execution** — agents with no inter-dependencies run concurrently; a failing level cancels its siblings instead of burning tokens
-- **Cost tracking** — per-agent and per-pipeline USD cost, and the run tells you which models it could not price
-- **Cost budgets** — `budget_usd=` aborts a run at a hard ceiling and hands back the results you already paid for
-- **Typed output that repairs itself** — declare a Pydantic schema; agentflow prompts with it, validates, and asks the model to fix a bad reply
-- **Token streaming** — `LLM.astream()` yields tokens for interactive UIs
-- **Decorator-based** — define agents as plain async functions, no boilerplate
-- **LLM response caching** — in-memory (or Redis) cache cuts cost on repeated runs
-- **Per-agent timeouts & retries** — `timeout=` and pipeline-level retry with exponential backoff + jitter
-- **Conditional branching** — skip agents dynamically based on upstream outputs
-- **Explainable DAG** — `pipe.explain()` prints the resolved levels without calling an LLM
-- **Observability** — lifecycle `Hooks`, an OpenTelemetry adapter, and structured JSON logs with run IDs
-- **Provider agnostic** — any OpenAI-compatible API (OpenAI, Groq, Together, Ollama, vLLM, OpenRouter)
-- **Fully typed** — ships `py.typed`; passes `mypy --strict`
-- **Minimal deps** — only `openai` + `pydantic`
+- **Tool / function calling**: `@tool` turns any Python function into an LLM tool; agents run a bounded ReAct loop
+- **Parallel execution**: agents with no inter-dependencies run concurrently; a failing level cancels its siblings instead of burning tokens
+- **Cost tracking**: per-agent and per-pipeline USD cost, and the run tells you which models it could not price
+- **Cost budgets**: `budget_usd=` aborts a run at a hard ceiling and hands back the results you already paid for
+- **Typed output that repairs itself**: declare a Pydantic schema; agentflow prompts with it, validates, and asks the model to fix a bad reply
+- **Token streaming**: `LLM.astream()` yields tokens for interactive UIs
+- **Decorator-based**: define agents as plain async functions, no boilerplate
+- **LLM response caching**: in-memory (or Redis) cache cuts cost on repeated runs
+- **Per-agent timeouts & retries**: `timeout=` and pipeline-level retry with exponential backoff + jitter
+- **Conditional branching**: skip agents dynamically based on upstream outputs
+- **Explainable DAG**: `pipe.explain()` prints the resolved levels without calling an LLM
+- **Observability**: lifecycle `Hooks`, an OpenTelemetry adapter, and structured JSON logs with run IDs
+- **Provider agnostic**: any OpenAI-compatible API (OpenAI, Groq, Together, Ollama, vLLM, OpenRouter)
+- **Fully typed**: ships `py.typed`; passes `mypy --strict`
+- **Minimal deps**: only `openai` + `pydantic`
 
 📖 **[Documentation →](docs/index.md)** · [Public API & stability contract](PUBLIC_API.md) · [Design decisions](docs/adr/)
 
@@ -36,13 +36,13 @@ pip install agentflowkit
 pip install "agentflowkit[redis]"
 ```
 
-## The showcase — earnings-call triage
+## The showcase: earnings-call triage
 
 One run of [`examples/earnings_triage.py`](examples/earnings_triage.py): a
 six-agent diamond DAG where a tool-calling fetcher feeds **three analysts
 running in parallel**, a risk synthesizer enforces a **typed Pydantic schema**,
 and the whole run sits under a **hard USD budget**. Works against any
-OpenAI-compatible endpoint — zero API keys with Ollama, free tier on Groq.
+OpenAI-compatible endpoint (zero API keys with Ollama, free tier on Groq).
 
 ```python
 pipe = Pipeline(llm=llm, budget_usd=0.25)      # hard cost ceiling per run
@@ -59,7 +59,7 @@ pipe.add(brief_writer,       depends_on=["risk_synthesizer"])    # gets the vali
 Representative output (`python examples/earnings_triage.py` with `gpt-4o-mini`):
 
 ```text
-━━━ Run 1 — cold (real LLM calls) ━━━
+━━━ Run 1: cold (real LLM calls) ━━━
   ▶ transcript_fetcher  (level 0)
   ✓ transcript_fetcher  1289 tok
   ▶ financials_analyst  (level 1)
@@ -73,10 +73,10 @@ Representative output (`python examples/earnings_triage.py` with `gpt-4o-mini`):
   ▶ brief_writer        (level 3)
   ✓ brief_writer        418 tok
 
-  wall time: 11.4s  (agent time summed: 27.9s — parallelism won 16.5s back)
+  wall time: 11.4s  (agent time summed: 27.9s, parallelism won 16.5s back)
   total cost: $0.001210
 
-━━━ Run 2 — warm (response cache) ━━━
+━━━ Run 2: warm (response cache) ━━━
   ✓ ... [cache hit] ×6
 
   wall time: 0.1s
@@ -89,7 +89,7 @@ Independent agents at the same DAG level execute **concurrently**. Dependent age
 
 ```mermaid
 graph TD
-    T[Task Input] --> L0[Level 0 — Parallel]
+    T[Task Input] --> L0["Level 0: Parallel"]
     L0 --> A1[researcher]
     L0 --> A2[fact_checker]
     A1 --> L1[Level 1]
@@ -145,7 +145,7 @@ asyncio.run(main())
 
 Give an agent tools and it becomes a **ReAct agent**: the model decides which
 functions to call, agentflow runs them, feeds results back, and repeats until a
-final answer. Schemas are generated from your type hints — you never write JSON.
+final answer. Schemas are generated from your type hints, so you never write JSON.
 
 ```python
 from agentflow import Agent, Pipeline, LLM, tool
@@ -183,7 +183,7 @@ Agents with no declared dependencies on each other run concurrently at the same 
 
 ```python
 pipe.add(agent_a)               # Level 0
-pipe.add(agent_b)               # Level 0 — runs in parallel with agent_a
+pipe.add(agent_b)               # Level 0 (runs in parallel with agent_a)
 pipe.add(agent_c, depends_on=["agent_a", "agent_b"])  # Level 1
 ```
 
@@ -223,13 +223,13 @@ print(f"Pipeline cost: ${result.total_cost:.6f}")
 Prices use longest-prefix matching, so `gpt-4o-2024-08-06` resolves to `gpt-4o`.
 Cache hits bill `$0.00`.
 
-A model with no price entry costs `$0.00` — a placeholder, not a measurement.
+A model with no price entry costs `$0.00` (a placeholder, not a measurement).
 That is never silent: the model is logged once, and the run tells you which
 models it could not price.
 
 ```python
 if result.unpriced_models:
-    print(f"total_cost is an undercount — no prices for {result.unpriced_models}")
+    print(f"total_cost is an undercount: no prices for {result.unpriced_models}")
 
 # Register prices for custom / self-hosted / newly-released models.
 # This is the authoritative override; the bundled table is indicative and drifts.
@@ -260,7 +260,7 @@ finish producing output that would be thrown away.
 ### Inspecting the DAG
 
 `explain()` renders the resolved graph without running anything or calling an
-LLM — and fails on a cycle or an unknown dependency exactly as `run()` would:
+LLM, and fails on a cycle or an unknown dependency exactly as `run()` would:
 
 ```python
 print(pipe.explain())
@@ -353,7 +353,7 @@ pipe = Pipeline(llm=llm, retry_failed_agents=2)  # up to 2 retries: 1s, 2s
 
 ### Structured Output Validation
 
-Declare a Pydantic schema and agentflow handles the rest — the schema is sent
+Declare a Pydantic schema and agentflow handles the rest: the schema is sent
 to the model, the reply is validated, and a malformed reply is repaired rather
 than fatal:
 
@@ -382,7 +382,7 @@ unwrapped locally, for free.
 
 This works identically on every OpenAI-compatible endpoint because the schema
 travels in the prompt. If you want a provider's native JSON mode instead, pass
-it yourself — `LLM.generate()` forwards any extra keyword to the provider:
+it yourself; `LLM.generate()` forwards any extra keyword to the provider:
 
 ```python
 await llm.generate(messages, response_format={"type": "json_object"}, seed=42)
@@ -409,11 +409,11 @@ async for event in pipe.stream("AI in Healthcare"):
         case "agent_start":
             print(f"▶ {event.agent} (level {event.data['level']})")
         case "agent_complete":
-            print(f"✓ {event.agent} — {event.data['tokens']} tokens, cached={event.data['cached']}")
+            print(f"✓ {event.agent}: {event.data['tokens']} tokens, cached={event.data['cached']}")
         case "agent_skipped":
             print(f"⏭ {event.agent} skipped")
         case "pipeline_complete":
-            print(f"Done — {event.data['total_tokens']} tokens across {event.data['levels_executed']} levels")
+            print(f"Done: {event.data['total_tokens']} tokens across {event.data['levels_executed']} levels")
 ```
 
 ### Structured Logging
@@ -446,13 +446,13 @@ What that buys you:
 - **A short learning curve.** Two decorators (`@Agent`, `@tool`) and a
   `Pipeline` are the whole public surface for most programs.
 - **The boilerplate you were going to write anyway.** Against the honest
-  baseline — hand-rolling `asyncio.gather()` — agentflow is the ~2,000 lines
+  baseline of hand-rolling `asyncio.gather()`, agentflow is the ~2,000 lines
   of retries with `Retry-After`, cost tables, budgets, caching, timeouts, and
   event plumbing you'd otherwise write under deadline, already typed and
   covered by ~250 tests.
 
-What agentflow deliberately does **not** do — reach for LangChain, CrewAI, or
-similar frameworks if you need these:
+What agentflow deliberately does **not** do (reach for LangChain, CrewAI, or
+similar frameworks if you need these):
 
 - No prompt-template library, document loaders, or vector-store integrations.
 - No agent marketplace or prebuilt personas; you write the agents.
@@ -513,18 +513,18 @@ llm = LLM(model="meta-llama/Llama-3-70b-chat-hf",
 
 ## Examples
 
-- [`examples/earnings_triage.py`](examples/earnings_triage.py) — **the showcase**: 6-agent diamond DAG with tools, parallel analysts, typed output, budget, and cache
-- [`examples/tool_agent.py`](examples/tool_agent.py) — a ReAct agent that calls tools (calculator + stock lookup)
-- [`examples/streaming_and_cost.py`](examples/streaming_and_cost.py) — token streaming + USD cost tracking
-- [`examples/research_crew.py`](examples/research_crew.py) — 3-agent sequential research pipeline
-- [`examples/code_reviewer.py`](examples/code_reviewer.py) — 2-agent code review pipeline
-- [`examples/market_analysis_crew.py`](examples/market_analysis_crew.py) — 5-agent parallel market analysis (diamond DAG)
-- [`examples/memory_chat_agents.py`](examples/memory_chat_agents.py) — two agents sharing context across separate runs via memory
-- [`examples/research_react_agent.py`](examples/research_react_agent.py) — a single ReAct agent researching with tools
-- [`examples/cpp_build_pipeline.py`](examples/cpp_build_pipeline.py) — write / compile / test loop driving a real toolchain
-- [`examples/robotics_mqtt_agent.py`](examples/robotics_mqtt_agent.py) — `Pipeline.serve()` daemon fed by an MQTT trigger *(needs the `mqtt` extra)*
-- [`examples/drone_telemetry_agent.py`](examples/drone_telemetry_agent.py) — `MQTTDaemon` with a Pydantic-validated trigger policy *(needs the `mqtt` extra)*
-- [`benchmarks/parallel_speedup.py`](benchmarks/parallel_speedup.py) — measured parallel vs. sequential speedup (~2×)
+- [`examples/earnings_triage.py`](examples/earnings_triage.py): **the showcase**, 6-agent diamond DAG with tools, parallel analysts, typed output, budget, and cache
+- [`examples/tool_agent.py`](examples/tool_agent.py): ReAct agent that calls tools (calculator + stock lookup)
+- [`examples/streaming_and_cost.py`](examples/streaming_and_cost.py): token streaming + USD cost tracking
+- [`examples/research_crew.py`](examples/research_crew.py): 3-agent sequential research pipeline
+- [`examples/code_reviewer.py`](examples/code_reviewer.py): 2-agent code review pipeline
+- [`examples/market_analysis_crew.py`](examples/market_analysis_crew.py): 5-agent parallel market analysis (diamond DAG)
+- [`examples/memory_chat_agents.py`](examples/memory_chat_agents.py): two agents sharing context across separate runs via memory
+- [`examples/research_react_agent.py`](examples/research_react_agent.py): single ReAct agent researching with tools
+- [`examples/cpp_build_pipeline.py`](examples/cpp_build_pipeline.py): write / compile / test loop driving a real toolchain
+- [`examples/robotics_mqtt_agent.py`](examples/robotics_mqtt_agent.py): `Pipeline.serve()` daemon fed by an MQTT trigger *(needs the `mqtt` extra)*
+- [`examples/drone_telemetry_agent.py`](examples/drone_telemetry_agent.py): `MQTTDaemon` with a Pydantic-validated trigger policy *(needs the `mqtt` extra)*
+- [`benchmarks/parallel_speedup.py`](benchmarks/parallel_speedup.py): measured parallel vs. sequential speedup (~2×)
 
 Every example is import-tested in CI, so they cannot drift away from the API.
 

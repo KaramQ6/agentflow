@@ -156,7 +156,7 @@ async def run_once(pipe: Pipeline, task: str, label: str) -> None:
                 d = event.data
                 print(
                     f"\n  wall time: {d['wall_time']}s  "
-                    f"(agent time summed: {d['total_duration']}s — parallelism won "
+                    f"(agent time summed: {d['total_duration']}s, parallelism won "
                     f"{round(d['total_duration'] - d['wall_time'], 1)}s back)"
                 )
                 print(f"  total cost: ${d['total_cost']:.6f}")
@@ -175,8 +175,8 @@ async def main() -> None:
     pipe = build_pipeline(llm)
     task = "ACME Corp Q3 2026 earnings call"
 
-    await run_once(pipe, task, "Run 1 — cold (real LLM calls)")
-    await run_once(pipe, task, "Run 2 — warm (response cache)")
+    await run_once(pipe, task, "Run 1: cold (real LLM calls)")
+    await run_once(pipe, task, "Run 2: warm (response cache)")
 
 
 if __name__ == "__main__":
