@@ -13,10 +13,8 @@ Define agents with decorators, wire them into a parallel DAG like a Makefile, en
 - **Hardware & IoT Native**: `MQTTDaemon` and `Pipeline.serve()` ingest live sensor streams (Mosquitto, HiveMQ) and trigger agent DAGs via non-blocking Pydantic threshold policies
 - **Hard USD Cost Budgets**: `budget_usd=` aborts a run at a hard ceiling and hands back partial results already paid for (`BudgetExceededError.partial_result`)
 - **100% Local & Free with Ollama**: drop-in support for any OpenAI-compatible server (Ollama, vLLM, LM Studio) for fully offline, private edge execution at $0.00 cost
-- **Tool / function calling**: `@tool` turns any Python function (serial reads, GPIO, HTTP, subprocesses) into an LLM tool with a bounded ReAct loop
 - **Parallel execution**: agents with no inter-dependencies run concurrently; a failing level cancels its siblings instead of burning tokens
-- **Cost tracking**: per-agent and per-pipeline USD cost, and the run tells you which models it could not price
-- **Cost budgets**: `budget_usd=` aborts a run at a hard ceiling and hands back the results you already paid for
+- **Tool / function calling**: `@tool` turns any Python function (serial reads, GPIO, HTTP, subprocesses) into an LLM tool with a bounded ReAct loop
 - **Typed output that repairs itself**: declare a Pydantic schema; agentflow prompts with it, validates, and asks the model to fix a bad reply
 - **Token streaming**: `LLM.astream()` yields tokens for interactive UIs
 - **Decorator-based**: define agents as plain async functions, no boilerplate
@@ -25,9 +23,7 @@ Define agents with decorators, wire them into a parallel DAG like a Makefile, en
 - **Conditional branching**: skip agents dynamically based on upstream outputs
 - **Explainable DAG**: `pipe.explain()` prints the resolved levels without calling an LLM
 - **Observability**: lifecycle `Hooks`, an OpenTelemetry adapter, and structured JSON logs with run IDs
-- **Provider agnostic**: any OpenAI-compatible API (OpenAI, Groq, Together, Ollama, vLLM, OpenRouter)
-- **Fully typed**: ships `py.typed`; passes `mypy --strict`
-- **Minimal deps**: only `openai` + `pydantic`
+- **Fully typed & zero bloat**: ships `py.typed`; passes `mypy --strict`; only `openai` + `pydantic` runtime dependencies
 
 📖 **[Documentation →](docs/index.md)** · [Public API & stability contract](PUBLIC_API.md) · [Design decisions](docs/adr/)
 
@@ -73,6 +69,9 @@ policy = PydanticTriggerPolicy(
     condition=lambda d: d.battery < 15 or d.altitude_drop_rate > 5,
     prompt_template="ALERT: Battery {battery}% | Descent {altitude_drop_rate}m/s at ({gps_lat}, {gps_lon})"
 )
+
+# Point to local Ollama (free/offline) or cloud (Groq/OpenAI):
+llm = LLM(model="llama3.2", base_url="http://localhost:11434/v1", api_key="ollama")
 
 pipe = Pipeline(llm=llm, budget_usd=0.01)       # hard cost ceiling per telemetry event
 pipe.add(threat_assessor, timeout=30)           # Level 0: classifies severity (CRITICAL / WARNING)
@@ -134,7 +133,7 @@ async def failsafe(task: str, context: dict) -> str:
 # Build DAG: failsafe runs after monitor completes
 pipe = Pipeline(llm=llm, budget_usd=0.01)
 pipe.add(monitor)
-pipe.add(failsafe, depends_on=["monitor"])
+pipe.add(failsafe, depends_on=["sensor_monitor"])
 
 async def main():
     sensor_payload = '{"device": "jetson-edge-01", "temp_c": 92.4, "cpu_load": 98.2}'

@@ -38,7 +38,7 @@ pinning).
 ### Changed
 - **Package repositioning**: description, keywords, and repository metadata
   realigned for Systems, IoT, Edge AI, and Robotics engineers.
-- **Demoted financial earnings triage example** to `examples/earnings_call.py`.
+- **Demoted financial earnings triage example** from the README showcase in favor of the drone telemetry safety monitor.
 - **Systems engineering framing**: replaced academic graph jargon with systems
   engineering analogies ("Makefile for Agents", "POSIX pipelines for LLMs").
 
