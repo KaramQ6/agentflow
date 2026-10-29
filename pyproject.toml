@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentflowkit"
 version = "0.7.0"
-description = "Lightweight multi-agent AI pipeline framework with parallel DAG execution, tool calling, and cost tracking"
+description = "Typed multi-agent pipelines for Systems & Edge Engineers — parallel DAG, native MQTT daemon, and hard USD budgets"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -13,6 +13,7 @@ authors = [{ name = "KaramQ6" }]
 keywords = [
     "ai", "agents", "multi-agent", "llm", "pipeline", "async", "dag", "parallel",
     "tool-calling", "function-calling", "react", "agent-framework",
+    "iot", "mqtt", "robotics", "edge-ai", "telemetry",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
