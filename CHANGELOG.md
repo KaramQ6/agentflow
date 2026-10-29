@@ -11,6 +11,50 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.7.1] — 2026-10-29
+
+Repositioning and security hardening release for Systems, IoT, Edge AI, and
+Robotics engineers. Delivers the complete Week 1 repositioning overhaul
+(Drone safety telemetry hero, 10-line sensor quickstart, local-first Ollama
+workflow, systems engineering terminology) alongside Week 2 release
+engineering deliverables (PyPI OIDC Trusted Publishing, comprehensive git
+history security audit, fail-closed sdist packaging hygiene, and build backend
+pinning).
+
+### Added
+- **Drone Safety Telemetry Monitor** (`examples/drone_telemetry_agent.py`) as
+  the canonical hero demo illustrating parallel battery and thermal anomaly
+  detection with emergency fail-safe actuation.
+- **10-line sensor quickstart** in `README.md` showcasing parallel agent DAG
+  pipelines.
+- **"Run 100% Local with Ollama"** guide in `README.md` for air-gapped and
+  edge deployments without external API keys.
+- **PyPI Trusted Publishing OIDC workflow** (`.github/workflows/publish.yml`)
+  with decoupled build and publish jobs eliminating long-lived API tokens.
+- **Explicit Hatch sdist exclude directives** in `pyproject.toml`
+  (`[tool.hatch.build.targets.sdist]`) providing defense-in-depth against
+  packaging untracked or local scratch directories.
+
+### Changed
+- **Package repositioning**: description, keywords, and repository metadata
+  realigned for Systems, IoT, Edge AI, and Robotics engineers.
+- **Demoted financial earnings triage example** to `examples/earnings_call.py`.
+- **Systems engineering framing**: replaced academic graph jargon with systems
+  engineering analogies ("Makefile for Agents", "POSIX pipelines for LLMs").
+
+### Fixed
+- **Pinned `hatchling<1.32`** in `build-system.requires` to prevent metadata 2.5
+  twine upload rejection on PyPI.
+- **Removed obsolete `"LEVEL_UP.md"`** entry from `scripts/check_sdist.py`
+  allowlist following repository cleanup.
+- **Updated `SECURITY.md`** supported versions table to include `0.7.x`.
+- **Replaced non-standard typographical dashes** with standard punctuation
+  across documentation.
+- **Verified `.bridgespace` and untracked scratch directories** exclusion from
+  source and binary distributions with zero secrets present across git history.
+
+---
+
 ## [0.7.0] — 2026-07-29
 
 Correctness and honesty release. Three things this fixes were actively

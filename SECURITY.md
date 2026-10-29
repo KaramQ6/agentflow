@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---|---|
+| 0.7.x | :white_check_mark: |
 | 0.6.x | ✅ |
 | < 0.6 | ❌ — upgrade; 0.5.0's only wheel was a Windows/cp311 binary |
 

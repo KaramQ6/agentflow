@@ -32,7 +32,6 @@ ALLOWED_TOP_LEVEL = {
     "LICENSE",
     "SECURITY.md",
     "PUBLIC_API.md",
-    "LEVEL_UP.md",
     "CODE_OF_CONDUCT.md",
     "mkdocs.yml",
     "docs",

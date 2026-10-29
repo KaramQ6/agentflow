@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentflowkit"
-version = "0.7.0"
+version = "0.7.1"
 description = "Typed multi-agent pipelines for Systems & Edge Engineers — parallel DAG, native MQTT daemon, and hard USD budgets"
 readme = "README.md"
 license = "MIT"
@@ -59,6 +59,15 @@ Changelog = "https://github.com/KaramQ6/agentflow/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentflow"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.bridgespace",
+    "/nova_bridge",
+    "/run_nova_bridge.py",
+    "/.claude",
+    "/CLAUDE.md",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
