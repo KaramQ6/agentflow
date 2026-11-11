@@ -8,11 +8,11 @@ import functools
 import json
 import logging
 import time
-import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
+from ._scope import RunScope, Spend, current_scope, new_run_id, run_scope, tracking
 from .agent import AgentLike, AgentSpec
 from .events import EventEmitter
 from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
@@ -91,6 +91,27 @@ async def _gather_level(
         error = task.exception()
         results.append(error if error is not None else task.result())
     return results
+
+
+def _run_totals(results: dict[str, AgentResult]) -> tuple[int, float]:
+    """Tokens and cost of the run: kept results plus attempts whose result was discarded."""
+    scope = current_scope()
+    discarded = scope.discarded if scope is not None else Spend()
+    tokens = sum(r.tokens_used for r in results.values()) + discarded.tokens
+    cost = sum(r.cost for r in results.values()) + discarded.cost
+    return tokens, round(cost, 6)
+
+
+def _discard(spend: Spend) -> None:
+    """Count the spend of an attempt whose result is thrown away."""
+    scope = current_scope()
+    if scope is not None:
+        scope.discarded.add(spend.cost, spend.tokens)
+
+
+def _discarded_state() -> tuple[float, int]:
+    scope = current_scope()
+    return (scope.discarded.cost, scope.discarded.tokens) if scope is not None else (0.0, 0)
 
 
 def _last_output_of(results: dict[str, AgentResult]) -> str:
@@ -339,43 +360,54 @@ class Pipeline:
         attempts = self._retry_failed_agents + 1
 
         for attempt in range(attempts):
+            spend = Spend()
             try:
-                if isinstance(agent, AgentSpec):
-                    # Run-scoped state travels with the call — mutating a
-                    # shared agent instance would cross-contaminate
-                    # concurrent pipeline runs.
-                    coro = agent.execute(
-                        task,
-                        context,
-                        self._llm,
-                        session_id=session_id,
-                        approval_policy=self._approval_policy,
-                    )
-                else:
-                    coro = agent.execute(task, context, self._llm)
-                if node.timeout is not None:
-                    try:
-                        result = await asyncio.wait_for(coro, timeout=node.timeout)
-                    except asyncio.TimeoutError:
-                        raise AgentTimeoutError(agent.name, node.timeout) from None
-                else:
-                    result = await coro
-
+                with tracking(spend):
+                    result = await self._attempt(node, task, context, session_id)
                 result.level = level_index
                 return result
 
             except PauseExecution:
-                raise  # let the pipeline-level handler deal with it
+                raise  # its spend travels in the pause state, on the resumed result
             except AgentTimeoutError:
+                _discard(spend)
                 raise  # timeouts are not retriable
             except AgentError:
+                _discard(spend)
                 if attempt < attempts - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 raise
+            except BaseException:
+                _discard(spend)  # includes cancellation by a failing sibling
+                raise
 
         # unreachable, but makes type-checkers happy
         raise AgentError(agent.name, "all retry attempts exhausted")
+
+    async def _attempt(
+        self, node: _PipelineNode, task: str, context: dict[str, Any], session_id: str
+    ) -> AgentResult:
+        """One execution of *node*, with its timeout."""
+        agent = node.agent
+        if isinstance(agent, AgentSpec):
+            # Run-scoped state travels with the call — mutating a shared agent
+            # instance would cross-contaminate concurrent pipeline runs.
+            coro = agent.execute(
+                task,
+                context,
+                self._llm,
+                session_id=session_id,
+                approval_policy=self._approval_policy,
+            )
+        else:
+            coro = agent.execute(task, context, self._llm)
+        if node.timeout is None:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=node.timeout)
+        except asyncio.TimeoutError:
+            raise AgentTimeoutError(agent.name, node.timeout) from None
 
     async def _persist_pause_state(
         self,
@@ -411,6 +443,7 @@ class Pipeline:
                     "context": context,
                     "current_level": level_index,
                     "paused_agent_name": pause_exc.agent_name,
+                    "discarded_spend": _discarded_state(),
                 }
             )
             await self._memory.save_context(
@@ -426,7 +459,7 @@ class Pipeline:
         """Raise BudgetExceededError if accumulated cost passed ``budget_usd``."""
         if self._budget_usd is None:
             return
-        spent = sum(r.cost for r in results.values())
+        _, spent = _run_totals(results)
         if spent > self._budget_usd:
             raise BudgetExceededError(self._budget_usd, round(spent, 6))
 
@@ -442,12 +475,13 @@ class Pipeline:
         session_id: str = "",
     ) -> PipelineResult:
         """Build the final PipelineResult (``paused`` when *pause* is given)."""
+        total_tokens, total_cost = _run_totals(results)
         return PipelineResult(
             unpriced_models=_unpriced_models_used(results),
             output=last_output,
             results=results,
-            total_tokens=sum(r.tokens_used for r in results.values()),
-            total_cost=round(sum(r.cost for r in results.values()), 6),
+            total_tokens=total_tokens,
+            total_cost=total_cost,
             total_duration=round(sum(r.duration for r in results.values()), 3),
             wall_time=round(time.perf_counter() - wall_start, 3),
             run_id=run_id,
@@ -618,9 +652,15 @@ class Pipeline:
         """
         wall_start = time.perf_counter()
         levels = self._resolve_levels()
+        run_id = new_run_id()
+        with run_scope(RunScope(run_id)):
+            return await self._run(task, run_id, levels, wall_start)
+
+    async def _run(
+        self, task: str, run_id: str, levels: list[list[_PipelineNode]], wall_start: float
+    ) -> PipelineResult:
         results: dict[str, AgentResult] = {}
         context: dict[str, Any] = {}
-        run_id = uuid.uuid4().hex[:8]
         session_id = self._session_id or run_id
 
         if self._hooks is not None:
@@ -708,6 +748,22 @@ class Pipeline:
             json.loads(agent_raw) if isinstance(agent_raw, str) else agent_raw
         )
 
+        scope = RunScope(pipeline_state["run_id"])
+        scope.discarded.add(*pipeline_state.get("discarded_spend", (0.0, 0)))
+        with run_scope(scope):
+            return await self._resume(session_id, human_feedback, approved, pipeline_state,
+                                      pause_data, wall_start)
+
+    async def _resume(
+        self,
+        session_id: str,
+        human_feedback: str,
+        approved: bool,
+        pipeline_state: dict[str, Any],
+        pause_data: dict[str, Any],
+        wall_start: float,
+    ) -> PipelineResult:
+        assert self._memory is not None  # checked by resume()
         task: str = pipeline_state["task"]
         run_id: str = pipeline_state["run_id"]
         current_level: int = pipeline_state["current_level"]
@@ -734,14 +790,22 @@ class Pipeline:
 
         # Resume the agent with run-scoped state — never mutate the shared
         # instance (concurrent pipeline runs may share it).
-        agent_result = await agent.resume_execution(
-            pause_data,
-            self._llm,
-            approved,
-            human_feedback,
-            session_id=session_id,
-            approval_policy=self._approval_policy,
-        )
+        spend = Spend()
+        try:
+            with tracking(spend):
+                agent_result = await agent.resume_execution(
+                    pause_data,
+                    self._llm,
+                    approved,
+                    human_feedback,
+                    session_id=session_id,
+                    approval_policy=self._approval_policy,
+                )
+        except PauseExecution:
+            raise
+        except BaseException:
+            _discard(spend)
+            raise
         results[paused_name] = agent_result
         context[paused_name] = (
             agent_result.data if agent_result.data is not None else agent_result.output
@@ -808,7 +872,11 @@ class Pipeline:
         context: dict[str, Any] = {}
 
         async def _run() -> None:
-            run_id = uuid.uuid4().hex[:8]
+            run_id = new_run_id()
+            with run_scope(RunScope(run_id)):
+                await _run_scoped(run_id)
+
+        async def _run_scoped(run_id: str) -> None:
             session_id = self._session_id or run_id
             try:
                 _, pause, _ = await self._run_levels(
@@ -832,10 +900,11 @@ class Pipeline:
                     )
                     return
 
+                total_tokens, total_cost = _run_totals(results)
                 emitter.emit(
                     "pipeline_complete",
-                    total_tokens=sum(r.tokens_used for r in results.values()),
-                    total_cost=round(sum(r.cost for r in results.values()), 6),
+                    total_tokens=total_tokens,
+                    total_cost=total_cost,
                     total_duration=round(sum(r.duration for r in results.values()), 3),
                     wall_time=round(time.perf_counter() - wall_start, 3),
                     agents_completed=len(results),

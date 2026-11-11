@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 
+from ._scope import record_spend
 from .exceptions import LLMError
 from .pricing import estimate_cost, warn_if_unpriced
 from .types import LLMResponse
@@ -165,6 +166,7 @@ class LLM:
                     tool_calls=_serialize_tool_calls(choice.message.tool_calls),
                     finish_reason=choice.finish_reason,
                 )
+                record_spend(result.cost, result.tokens)
 
                 # Write to cache (never cache tool-calling turns)
                 if use_cache:

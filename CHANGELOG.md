@@ -9,6 +9,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **A run's total now includes every billed call.** An attempt that failed and was retried,
+  timed out, or was cancelled by a failing sibling used to vanish from
+  `PipelineResult.total_cost` and `total_tokens`, and from the budget check (COST-1). The
+  spend of such attempts is now counted, including across a HITL pause and `resume()`.
+  `AgentResult.cost` is unchanged: it still covers only the result it belongs to.
+
+### Changed
+
+- **`run_id` is 32 hex characters** (was 8). Eight collide at about 65k runs, and run-keyed
+  ledgers are coming in 0.8.0. Code that parses or truncates run ids should not assume a length.
+
 ---
 
 ## [0.7.1] — 2026-10-29
