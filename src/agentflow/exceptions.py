@@ -55,9 +55,9 @@ class PipelineError(AgentFlowError):
 class BudgetExceededError(PipelineError):
     """Raised when a pipeline run's accumulated cost exceeds ``budget_usd``.
 
-    The budget is checked after each DAG level completes (an in-flight LLM
-    call cannot be aborted), so the final cost may overshoot by at most one
-    level's spend.
+    Every LLM call reserves its worst-case cost before it is sent; this is
+    raised when a reservation cannot fit even after in-flight calls settle.
+    ``spent_usd`` includes attempts whose result was discarded. See ADR 0005.
 
     Attributes:
         partial_result: The ``PipelineResult`` for the levels that did

@@ -53,7 +53,7 @@ Works against any OpenAI-compatible API — 100% local and free with Ollama, or 
 
 ```python
 from pydantic import BaseModel, Field
-from agentflow import LLM, Pipeline
+from agentflow import LLM, Pipeline, register_price
 from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy
 
 class DroneTelemetry(BaseModel):
@@ -72,6 +72,7 @@ policy = PydanticTriggerPolicy(
 
 # Point to local Ollama (free/offline) or cloud (Groq/OpenAI):
 llm = LLM(model="llama3.2", base_url="http://localhost:11434/v1", api_key="ollama")
+register_price("llama3.2", 0, 0)                 # local model: free, so the budget can measure it
 
 pipe = Pipeline(llm=llm, budget_usd=0.01)       # hard cost ceiling per telemetry event
 pipe.add(threat_assessor, timeout=30)           # Level 0: classifies severity (CRITICAL / WARNING)
@@ -112,7 +113,7 @@ You don't need an MQTT broker or hardware setup to test agentflow. Run a local s
 
 ```python
 import asyncio
-from agentflow import Agent, Pipeline, LLM
+from agentflow import Agent, Pipeline, LLM, register_price
 
 # Run local & free with Ollama, or use Groq / OpenAI:
 llm = LLM(
@@ -129,6 +130,9 @@ async def monitor(task: str, context: dict) -> str:
 async def failsafe(task: str, context: dict) -> str:
     analysis = context["sensor_monitor"]
     return f"Based on telemetry analysis: '{analysis}', specify safety action or NOMINAL."
+
+# A budget needs a price for the model. Local models are free:
+register_price("llama3.2", 0, 0)
 
 # Build DAG: failsafe runs after monitor completes
 pipe = Pipeline(llm=llm, budget_usd=0.01)
@@ -163,6 +167,9 @@ llm = LLM(
     api_key="ollama",  # dummy key, required by OpenAI client
 )
 ```
+
+A budget needs a price for every model, so a local model is declared free:
+`register_price("llama3.2", 0, 0)`. Without `budget_usd` no price is needed.
 
 - **Zero API bills**: All inference stays on your local hardware.
 - **Zero telemetry**: No prompts or payloads leave your machine.
@@ -268,8 +275,9 @@ register_price("my-finetuned-model", prompt_per_1m=0.50, completion_per_1m=1.50)
 
 ### Cost Budgets
 
-Put a hard ceiling on a run. The budget is checked after each DAG level, and
-the error hands back the work you already paid for instead of discarding it:
+Put a hard ceiling on a run. Every LLM call reserves its worst-case cost before
+it is sent, so parallel agents and tool loops cannot run past the ceiling. The
+error hands back the work you already paid for instead of discarding it:
 
 ```python
 from agentflow import BudgetExceededError

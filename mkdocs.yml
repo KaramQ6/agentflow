@@ -68,3 +68,4 @@ nav:
       - Fail-fast DAG levels: adr/0001-fail-fast-dag-levels.md
       - Structured output: adr/0002-structured-output-via-prompt-and-repair.md
       - Unpriced models: adr/0003-unpriced-models-report-zero-loudly.md
+      - Hard budget by reservation: adr/0005-hard-budget-by-reservation.md

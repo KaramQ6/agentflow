@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import agentflow.pipeline as pipeline_module
-from agentflow.llm import _estimate_prompt_tokens
 from agentflow import LLM, AgentError, BaseAgent, InMemoryContext, Pipeline, register_price
+from agentflow.llm import _estimate_prompt_tokens
 from agentflow.types import AgentResult
 
 PRICE = 1_000_000.0  # $1 per token each way, so every number below is exact.

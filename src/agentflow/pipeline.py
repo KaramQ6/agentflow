@@ -15,11 +15,9 @@ from typing import TYPE_CHECKING, Any
 from ._scope import Budget, RunScope, Spend, current_scope, new_run_id, run_scope, tracking
 from .agent import AgentLike, AgentSpec
 from .events import EventEmitter
-from .llm import unpriced_budget_error
-from .pricing import is_priced
 from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
 from .hitl import ApprovalPolicy, PauseExecution
-from .llm import LLM
+from .llm import LLM, unpriced_budget_error
 from .memory import BaseMemory
 from .observability import Hooks, safe_invoke
 from .pricing import is_priced
@@ -180,8 +178,9 @@ class Pipeline:
     Args:
         llm: The LLM provider for all agents.
         retry_failed_agents: How many times to retry a failed agent (default 0).
-        budget_usd: Optional hard cost ceiling for a single run. Checked after
-            each DAG level; exceeding it raises BudgetExceededError.
+        budget_usd: Optional hard cost ceiling for a single run. Each LLM call
+            reserves its worst case first; a call that cannot fit raises
+            BudgetExceededError. The model must have a price (see ADR 0005).
         max_concurrency: Maximum agents in flight at once, across the whole
             run. Without it a level of 40 agents opens 40 concurrent LLM
             calls. ``None`` (default) means the level width is the only limit.
@@ -359,8 +358,9 @@ class Pipeline:
         """A run scope with this pipeline's budget. Refuses a budget that cannot be measured."""
         if self._budget_usd is None:
             return RunScope(run_id)
-        model = getattr(self._llm, "model", "")
-        if not is_priced(model):
+        # A duck-typed LLM without a model id is checked per call instead, where it bills.
+        model = getattr(self._llm, "model", None)
+        if model and not is_priced(model):
             raise unpriced_budget_error(model)
         return RunScope(run_id, budget=Budget(self._budget_usd, spent))
 

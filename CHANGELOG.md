@@ -17,8 +17,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   spend of such attempts is now counted, including across a HITL pause and `resume()`.
   `AgentResult.cost` is unchanged: it still covers only the result it belongs to.
 
+- **`budget_usd` is a real ceiling.** It used to be checked once per DAG level, so a
+  level of parallel agents overshot it tenfold and a tool loop never checked it at all
+  (COST-2, COST-3). Every LLM call now reserves its worst-case cost before it is sent and
+  settles after. A refusal is final for the run and is not retried. See ADR 0005.
+
 ### Changed
 
+- **Breaking: an unpriced model with `budget_usd` set raises `PipelineError`** before the
+  first call (COST-4). A budget that cannot be measured is not a budget. Migration for local
+  models: `register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`. Without a budget
+  nothing changes (ADR 0003 still holds).
 - **`run_id` is 32 hex characters** (was 8). Eight collide at about 65k runs, and run-keyed
   ledgers are coming in 0.8.0. Code that parses or truncates run ids should not assume a length.
 

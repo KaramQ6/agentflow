@@ -42,8 +42,12 @@ Covered semantics (not just names):
   `output_retries` times before raising
   (see [ADR 0002](docs/adr/0002-structured-output-via-prompt-and-repair.md)).
 - An unpriced model costs `0.0` and is reported in
-  `PipelineResult.unpriced_models`; it never raises
-  (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)).
+  `PipelineResult.unpriced_models`
+  (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
+  only when `budget_usd` is set, because a budget must be measurable
+  (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- `budget_usd` is enforced by reserving each LLM call's worst-case cost before it
+  is sent, and its total includes discarded attempts. *Changed in 0.8.0.*
 - `LLM.generate(**extra)` forwards unknown keywords to the provider unchanged,
   and they participate in the cache key.
 - `depends_on` accepts forward references; unknown names raise when the graph
