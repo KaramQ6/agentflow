@@ -12,9 +12,11 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from ._scope import RunScope, Spend, current_scope, new_run_id, run_scope, tracking
+from ._scope import Budget, RunScope, Spend, current_scope, new_run_id, run_scope, tracking
 from .agent import AgentLike, AgentSpec
 from .events import EventEmitter
+from .llm import unpriced_budget_error
+from .pricing import is_priced
 from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
 from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
@@ -107,6 +109,12 @@ def _discard(spend: Spend) -> None:
     scope = current_scope()
     if scope is not None:
         scope.discarded.add(spend.cost, spend.tokens)
+
+
+def _budget_stop() -> Exception | None:
+    """The run's budget refusal, if any. Agents may wrap or swallow it; the pipeline must not."""
+    scope = current_scope()
+    return scope.budget.blocked if scope is not None and scope.budget is not None else None
 
 
 def _discarded_state() -> tuple[float, int]:
@@ -347,6 +355,15 @@ class Pipeline:
 
         return "\n".join(lines)
 
+    def _new_scope(self, run_id: str, spent: float = 0.0) -> RunScope:
+        """A run scope with this pipeline's budget. Refuses a budget that cannot be measured."""
+        if self._budget_usd is None:
+            return RunScope(run_id)
+        model = getattr(self._llm, "model", "")
+        if not is_priced(model):
+            raise unpriced_budget_error(model)
+        return RunScope(run_id, budget=Budget(self._budget_usd, spent))
+
     async def _execute_node(
         self,
         node: _PipelineNode,
@@ -372,8 +389,11 @@ class Pipeline:
             except AgentTimeoutError:
                 _discard(spend)
                 raise  # timeouts are not retriable
-            except AgentError:
+            except AgentError as exc:
                 _discard(spend)
+                stop = _budget_stop()
+                if stop is not None:
+                    raise stop from exc  # retrying cannot make a full budget fit
                 if attempt < attempts - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -459,6 +479,9 @@ class Pipeline:
         """Raise BudgetExceededError if accumulated cost passed ``budget_usd``."""
         if self._budget_usd is None:
             return
+        stop = _budget_stop()
+        if stop is not None:
+            raise stop
         _, spent = _run_totals(results)
         if spent > self._budget_usd:
             raise BudgetExceededError(self._budget_usd, round(spent, 6))
@@ -653,7 +676,7 @@ class Pipeline:
         wall_start = time.perf_counter()
         levels = self._resolve_levels()
         run_id = new_run_id()
-        with run_scope(RunScope(run_id)):
+        with run_scope(self._new_scope(run_id)):
             return await self._run(task, run_id, levels, wall_start)
 
     async def _run(
@@ -748,8 +771,10 @@ class Pipeline:
             json.loads(agent_raw) if isinstance(agent_raw, str) else agent_raw
         )
 
-        scope = RunScope(pipeline_state["run_id"])
-        scope.discarded.add(*pipeline_state.get("discarded_spend", (0.0, 0)))
+        discarded = pipeline_state.get("discarded_spend", (0.0, 0))
+        spent_before = discarded[0] + sum(r["cost"] for r in pipeline_state["results"].values())
+        scope = self._new_scope(pipeline_state["run_id"], spent=spent_before)
+        scope.discarded.add(*discarded)
         with run_scope(scope):
             return await self._resume(session_id, human_feedback, approved, pipeline_state,
                                       pause_data, wall_start)
@@ -873,7 +898,7 @@ class Pipeline:
 
         async def _run() -> None:
             run_id = new_run_id()
-            with run_scope(RunScope(run_id)):
+            with run_scope(self._new_scope(run_id)):
                 await _run_scoped(run_id)
 
         async def _run_scoped(run_id: str) -> None:

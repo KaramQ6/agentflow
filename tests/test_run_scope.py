@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import agentflow.pipeline as pipeline_module
+from agentflow.llm import _estimate_prompt_tokens
 from agentflow import LLM, AgentError, BaseAgent, InMemoryContext, Pipeline, register_price
 from agentflow.types import AgentResult
 
@@ -87,15 +88,19 @@ async def test_concurrent_runs_on_one_pipeline_keep_separate_ledgers():
 
 
 @pytest.mark.asyncio
-async def test_spend_of_a_failed_run_is_on_the_partial_result_of_a_budget_stop():
-    pipe = Pipeline(llm=_billed_llm(), retry_failed_agents=1, budget_usd=3.0)
-    pipe.add(FlakyAgent("a", failures=1))
+async def test_the_budget_counts_the_spend_of_discarded_attempts():
+    llm = _billed_llm()
+    llm.max_tokens = 1
+    reservation = PRICE / 1_000_000 * (_estimate_prompt_tokens([{"role": "user", "content": "go"}], None) + 1)
+    # Two discarded attempts bill $2 each. The third reservation fits only if they are forgotten.
+    pipe = Pipeline(llm=llm, retry_failed_agents=2, budget_usd=4.0 + reservation - 0.5)
+    pipe.add(FlakyAgent("a", failures=2))
 
     with pytest.raises(pipeline_module.BudgetExceededError) as caught:
         await pipe.run("go")
 
     assert caught.value.spent_usd == pytest.approx(4.0), (
-        "the budget must see the discarded attempt's spend, not only the surviving result"
+        "the budget must see the discarded attempts' spend, not only surviving results"
     )
     assert caught.value.partial_result.total_cost == pytest.approx(4.0)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from collections.abc import AsyncGenerator
@@ -11,9 +12,9 @@ from typing import TYPE_CHECKING, Any, cast
 from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 
-from ._scope import record_spend
-from .exceptions import LLMError
-from .pricing import estimate_cost, warn_if_unpriced
+from ._scope import current_scope, record_spend
+from .exceptions import LLMError, PipelineError
+from .pricing import estimate_cost, is_priced, warn_if_unpriced
 from .types import LLMResponse
 
 if TYPE_CHECKING:
@@ -123,14 +124,44 @@ class LLM:
                 # the (informational) token counts from the original call.
                 return LLMResponse(**{**cached, "cached": True, "cost": 0.0})
 
-        start = time.perf_counter()
-        last_error: Exception | None = None
-
         params: dict[str, Any] = dict(extra)
         if tools:
             params["tools"] = tools
             params["tool_choice"] = tool_choice or "auto"
 
+        scope = current_scope()
+        budget = scope.budget if scope is not None else None
+        if budget is None:
+            return await self._request(effective_model, messages, temperature, max_tokens, params,
+                                       use_cache, cache_key)
+        if not is_priced(effective_model):
+            raise budget.block(unpriced_budget_error(effective_model))
+        reservation = estimate_cost(
+            effective_model, _estimate_prompt_tokens(messages, tools), max_tokens or self.max_tokens
+        )
+        await budget.reserve(reservation)
+        billed = 0.0
+        try:
+            result = await self._request(effective_model, messages, temperature, max_tokens, params,
+                                         use_cache, cache_key)
+            billed = result.cost
+            return result
+        finally:
+            budget.settle(reservation, billed)
+
+    async def _request(
+        self,
+        effective_model: str,
+        messages: list[dict[str, Any]],
+        temperature: float | None,
+        max_tokens: int | None,
+        params: dict[str, Any],
+        use_cache: bool,
+        cache_key: str,
+    ) -> LLMResponse:
+        """The provider round trip, with retries on transient errors."""
+        start = time.perf_counter()
+        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             # Rate limiting per attempt; acquire outside the try so a failed
             # acquire is never paired with a release in the finally below.
@@ -251,6 +282,20 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def unpriced_budget_error(model: str) -> PipelineError:
+    return PipelineError(
+        f"budget_usd is set, but model {model!r} has no registered price, so the budget cannot be "
+        f"measured. For a local or free model call agentflow.register_price({model!r}, "
+        f"prompt_per_1m=0, completion_per_1m=0); otherwise register its real price."
+    )
+
+
+def _estimate_prompt_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> int:
+    """Deliberately pessimistic: 3 characters per token, where real text averages about 4."""
+    chars = len(json.dumps(messages, default=str)) + (len(json.dumps(tools)) if tools else 0)
+    return chars // 3 + 1
 
 
 def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]] | None:
