@@ -18,19 +18,110 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
+import sys
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Callable
-from typing import Any
+from collections.abc import AsyncGenerator, Callable, Coroutine
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 try:
     import aiomqtt  # noqa: F401
 except ImportError:  # pragma: no cover
-    aiomqtt = None
+    aiomqtt = None  # type: ignore[assignment]
+
+# Only the real client needs add_reader. Tests swap ``aiomqtt`` for a fake.
+_REAL_AIOMQTT = aiomqtt
 
 _logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+_PROACTOR_HELP = (
+    "aiomqtt needs an event loop with add_reader, and the default Windows loop "
+    "(ProactorEventLoop) has none. Start your program with "
+    "agentflow.triggers.run_mqtt(main()) instead of asyncio.run(main())."
+)
+
+
+def run_mqtt(main: Coroutine[Any, Any, _T]) -> _T:
+    """``asyncio.run`` on a loop aiomqtt can use. On Windows that is a selector loop."""
+    if sys.platform != "win32":
+        return asyncio.run(main)
+    loop = asyncio.SelectorEventLoop()
+    try:
+        return loop.run_until_complete(main)
+    finally:
+        loop.close()
+
+
+@dataclass(frozen=True)
+class _Broker:
+    """Connection settings shared by MQTTTrigger and MQTTDaemon."""
+
+    host: str
+    port: int
+    topic: str
+    username: str | None = None
+    password: str | None = None
+    qos: int = 0
+    tls_context: ssl.SSLContext | None = None
+    backoff_base: float = 1.0
+    backoff_max: float = 60.0
+    backoff_jitter: float = 0.5
+
+
+async def _messages(broker: _Broker, owner: str) -> AsyncGenerator[tuple[str, int, str], None]:
+    """Yield ``(topic, qos, payload_text)`` forever, reconnecting with capped backoff.
+
+    A connection error, or a stream the broker closed cleanly, backs off and
+    reconnects. An event loop that cannot run aiomqtt fails at once.
+    """
+    if aiomqtt is None:
+        raise ImportError(
+            f"aiomqtt is required for {owner}.  Install with: pip install agentflowkit[mqtt]"
+        )
+    proactor = getattr(asyncio, "ProactorEventLoop", None)  # exists on Windows only
+    if aiomqtt is _REAL_AIOMQTT and proactor is not None and isinstance(asyncio.get_running_loop(), proactor):
+        # paho raises NotImplementedError inside a loop callback, which never reaches
+        # this code: the connect just times out and the reconnect loop spins forever.
+        raise RuntimeError(_PROACTOR_HELP)
+    delay = broker.backoff_base
+    while True:
+        try:
+            async with aiomqtt.Client(
+                hostname=broker.host,
+                port=broker.port,
+                username=broker.username,
+                password=broker.password,
+                tls_context=broker.tls_context,
+            ) as client:
+                await client.subscribe(broker.topic, qos=broker.qos)
+                _logger.info("%s connected to %s:%d [%s]", owner, broker.host, broker.port, broker.topic)
+                delay = broker.backoff_base
+                async for message in client.messages:
+                    yield _decode(message)
+        except Exception as exc:
+            _logger.warning("%s connection lost (%s). Reconnecting in %.1fs...", owner, exc, delay)
+        else:
+            # A clean end must back off too: reconnecting at once would spin
+            # with no suspension point and starve the event loop.
+            _logger.warning("%s message stream ended. Reconnecting in %.1fs...", owner, delay)
+        jitter = time.monotonic() % 1 * broker.backoff_jitter
+        await asyncio.sleep(delay + jitter)
+        delay = min(delay * 2, broker.backoff_max)
+
+
+def _decode(message: Any) -> tuple[str, int, str]:
+    try:
+        payload = message.payload.decode("utf-8")
+    except UnicodeDecodeError:
+        payload = message.payload.decode("utf-8", errors="replace")
+    # aiomqtt 2.x gives qos as a plain int.
+    return message.topic.value, int(message.qos), payload
 
 
 class BaseTrigger(ABC):
@@ -76,6 +167,12 @@ class MQTTTrigger(BaseTrigger):
             ``"Analyze this sensor anomaly: {data}"``.
         username: Optional broker username.
         password: Optional broker password.
+        qos: Subscription QoS (0, 1 or 2).
+        tls_context: An ``ssl.SSLContext`` to connect over TLS.
+        backoff_base: First reconnect delay in seconds. A dropped connection
+            reconnects instead of ending the stream.
+        backoff_max: Longest reconnect delay in seconds.
+        backoff_jitter: Random jitter added to each delay, in seconds.
 
     Example::
 
@@ -96,50 +193,26 @@ class MQTTTrigger(BaseTrigger):
         prompt_template: str = "Analyze this data: {data}",
         username: str | None = None,
         password: str | None = None,
+        qos: int = 0,
+        tls_context: ssl.SSLContext | None = None,
+        backoff_base: float = 1.0,
+        backoff_max: float = 60.0,
+        backoff_jitter: float = 0.5,
     ):
-        self._broker = broker
-        self._port = port
-        self._topic = topic
+        self._broker = _Broker(broker, port, topic, username, password, qos, tls_context,
+                               backoff_base, backoff_max, backoff_jitter)
         self._prompt_template = prompt_template
-        self._username = username
-        self._password = password
 
     async def listen(self) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
-        """Connect to broker, subscribe to topic, and yield incoming payloads."""
-        if aiomqtt is None:
-            raise ImportError(
-                "aiomqtt is required for MQTTTrigger.  Install with: "
-                "pip install agentflowkit[mqtt]"
-            )
-
-        async with aiomqtt.Client(
-            hostname=self._broker,
-            port=self._port,
-            username=self._username,
-            password=self._password,
-        ) as client:
-            await client.subscribe(self._topic)
-            async for message in client.messages:
-                try:
-                    payload_str = message.payload.decode("utf-8")
-                except UnicodeDecodeError:
-                    payload_str = message.payload.decode("utf-8", errors="replace")
-
-                ctx: dict[str, Any] = {
-                    "topic": message.topic.value,
-                    "qos": message.qos.value,
-                    "payload_raw": payload_str,
-                }
-
-                # Attempt JSON parse; fall back to raw string on failure.
-                try:
-                    parsed = json.loads(payload_str)
-                    ctx["payload"] = parsed
-                except (ValueError, TypeError):
-                    ctx["payload"] = payload_str  # non-JSON payload → raw string
-
-                task_prompt = self._prompt_template.format(data=payload_str)
-                yield task_prompt, ctx
+        """Connect to broker, subscribe to topic, and yield incoming payloads forever."""
+        async for topic, qos, payload_str in _messages(self._broker, "MQTTTrigger"):
+            ctx: dict[str, Any] = {"topic": topic, "qos": qos, "payload_raw": payload_str}
+            # Attempt JSON parse; fall back to raw string on failure.
+            try:
+                ctx["payload"] = json.loads(payload_str)
+            except (ValueError, TypeError):
+                ctx["payload"] = payload_str  # non-JSON payload: raw string
+            yield self._prompt_template.format(data=payload_str), ctx
 
 
 class _LenientFields(dict[str, Any]):
@@ -257,6 +330,18 @@ class MQTTDaemon:
         backoff_base: Base delay in seconds for exponential backoff (default 1.0).
         backoff_max: Maximum backoff delay in seconds (default 60.0).
         backoff_jitter: Add random jitter up to this many seconds (default 0.5).
+        qos: Subscription QoS (0, 1 or 2).
+        tls_context: An ``ssl.SSLContext`` to connect over TLS.
+        cooldown_s: Alarm debounce per topic. A payload that starts an alarm
+            (the policy turns true) fires at once; while it stays true it fires
+            again at most once per ``cooldown_s``. ``None`` fires only on a new
+            alarm, ``0`` on every triggering message (the 0.7 behaviour).
+        max_concurrent: Most handlers in flight at once. An alarm that arrives
+            while the daemon is full is logged and skipped, and fires on the
+            next triggering message. ``None`` means no limit.
+
+    A message that is not a JSON object, or that makes the policy raise, is
+    logged and skipped. It never drops the connection.
 
     Example::
 
@@ -281,26 +366,22 @@ class MQTTDaemon:
         backoff_base: float = 1.0,
         backoff_max: float = 60.0,
         backoff_jitter: float = 0.5,
+        qos: int = 0,
+        tls_context: ssl.SSLContext | None = None,
+        cooldown_s: float | None = 30.0,
+        max_concurrent: int | None = 5,
     ):
-        self._broker = broker
-        self._port = port
-        self._topic = topic
+        self._broker = _Broker(broker, port, topic, username, password, qos, tls_context,
+                               backoff_base, backoff_max, backoff_jitter)
         self._policy = policy
         self._handler = handler
-        self._username = username
-        self._password = password
-        self._backoff_base = backoff_base
-        self._backoff_max = backoff_max
-        self._backoff_jitter = backoff_jitter
+        self._cooldown_s = cooldown_s
+        self._max_concurrent = max_concurrent
+        # topic -> monotonic time of the last fire, while that topic is in alarm.
+        self._alarms: dict[str, float] = {}
         # Strong references to in-flight handler tasks; asyncio only keeps
         # weak references, so unanchored tasks can be garbage-collected mid-run.
         self._handler_tasks: set[asyncio.Task[Any]] = set()
-
-    async def _backoff(self, delay: float) -> float:
-        """Wait *delay* seconds (plus jitter) and return the next delay."""
-        jitter = time.monotonic() % 1 * self._backoff_jitter
-        await asyncio.sleep(delay + jitter)
-        return min(delay * 2, self._backoff_max)
 
     async def serve(self) -> None:
         """Run the MQTT daemon forever with automatic reconnection.
@@ -308,76 +389,41 @@ class MQTTDaemon:
         Spawns ``asyncio.create_task`` for each triggered pipeline so the
         MQTT listener is never blocked.
         """
-        if aiomqtt is None:
-            raise ImportError(
-                "aiomqtt is required for MQTTDaemon.  Install with: "
-                "pip install agentflowkit[mqtt]"
+        try:
+            async for topic, qos, payload_str in _messages(self._broker, "MQTT daemon"):
+                try:
+                    self._dispatch(topic, qos, payload_str)
+                except Exception:
+                    _logger.exception("MQTT daemon skipped a message on %s", topic)
+        except asyncio.CancelledError:
+            _logger.info("MQTT daemon cancelled")
+            raise
+
+    def _dispatch(self, topic: str, qos: int, payload_str: str) -> None:
+        """Run the policy on one message and start the handler if an alarm is due."""
+        try:
+            parsed = json.loads(payload_str)
+        except (json.JSONDecodeError, TypeError):
+            _logger.debug("Non-JSON MQTT payload on %s", topic)
+            return
+        if not isinstance(parsed, dict):
+            _logger.debug("MQTT payload on %s is JSON but not an object; skipped", topic)
+            return
+        if not self._policy.evaluate(parsed):
+            self._alarms.pop(topic, None)  # recovered: the next trigger is a new alarm
+            return
+        now = time.monotonic()
+        last = self._alarms.get(topic)
+        if last is not None and (self._cooldown_s is None or now - last < self._cooldown_s):
+            return
+        if self._max_concurrent is not None and len(self._handler_tasks) >= self._max_concurrent:
+            _logger.warning(
+                "MQTT daemon at max_concurrent=%d; alarm on %s skipped", self._max_concurrent, topic
             )
-
-        delay = self._backoff_base
-
-        while True:
-            try:
-                async with aiomqtt.Client(
-                    hostname=self._broker,
-                    port=self._port,
-                    username=self._username,
-                    password=self._password,
-                ) as client:
-                    await client.subscribe(self._topic)
-                    _logger.info(
-                        "MQTT daemon connected to %s:%d [%s]",
-                        self._broker,
-                        self._port,
-                        self._topic,
-                    )
-                    delay = self._backoff_base  # reset backoff on success
-
-                    async for message in client.messages:
-                        try:
-                            payload_str = message.payload.decode("utf-8")
-                        except UnicodeDecodeError:
-                            payload_str = message.payload.decode("utf-8", errors="replace")
-
-                        try:
-                            parsed: dict[str, Any] = json.loads(payload_str)
-                        except (json.JSONDecodeError, TypeError):
-                            _logger.debug("Non-JSON MQTT payload on %s", message.topic.value)
-                            continue
-
-                        ctx: dict[str, Any] = {
-                            "topic": message.topic.value,
-                            "qos": message.qos.value,
-                        }
-
-                        if self._policy.evaluate(parsed):
-                            task_prompt = self._policy.build_task_prompt(parsed)
-                            # Non-blocking: spawn handler in background task
-                            task = asyncio.create_task(
-                                self._handler(task_prompt, parsed, ctx)
-                            )
-                            self._handler_tasks.add(task)
-                            task.add_done_callback(self._handler_tasks.discard)
-
-            except asyncio.CancelledError:
-                _logger.info("MQTT daemon cancelled")
-                raise
-
-            except Exception as exc:
-                _logger.warning(
-                    "MQTT daemon connection lost (%s). "
-                    "Reconnecting in %.1fs...",
-                    exc,
-                    delay,
-                )
-                delay = await self._backoff(delay)
-
-            else:
-                # The stream ended without raising — the broker closed the
-                # subscription cleanly. Reconnecting straight away would spin
-                # this loop with no suspension point and starve the event loop,
-                # so a clean end backs off exactly like a dropped connection.
-                _logger.warning(
-                    "MQTT message stream ended. Reconnecting in %.1fs...", delay
-                )
-                delay = await self._backoff(delay)
+            return  # not recorded as fired, so the next triggering message retries it
+        task = asyncio.create_task(
+            self._handler(self._policy.build_task_prompt(parsed), parsed, {"topic": topic, "qos": qos})
+        )
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._handler_tasks.discard)
+        self._alarms[topic] = now

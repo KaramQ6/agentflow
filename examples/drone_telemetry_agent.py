@@ -29,7 +29,6 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys
@@ -39,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from pydantic import BaseModel, Field  # noqa: E402
 
 from agentflow import LLM, Agent, LoggingHooks, Pipeline  # noqa: E402
-from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy  # noqa: E402
+from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy, run_mqtt  # noqa: E402
 from agentflow.types import PipelineResult  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -164,4 +163,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_mqtt(main())  # asyncio.run on a loop aiomqtt supports, on Windows too

@@ -22,8 +22,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (COST-2, COST-3). Every LLM call now reserves its worst-case cost before it is sent and
   settles after. A refusal is final for the run and is not retried. See ADR 0005.
 
+- **MQTT works against a real broker.** `MQTTTrigger` and `MQTTDaemon` crashed on the first
+  real message: aiomqtt 2.x gives `qos` as an int, and the test fake gave an object (MQTT-4).
+  Tests now also run against a real broker (`amqtt`) with the real client.
+- **One malformed MQTT message no longer kills the daemon.** A payload such as `42` made
+  `MQTTDaemon` tear down and rebuild its connection in a loop (2,599 reconnects, no message
+  handled). Non-object JSON and policy errors are now logged and skipped per message (MQTT-1).
+- **`MQTTTrigger` reconnects** with backoff instead of ending its stream, so
+  `Pipeline.serve()` survives a broker restart (SERVE-2).
+- **Windows: a clear error instead of a silent reconnect loop.** aiomqtt cannot run on the
+  default Proactor loop. The daemon and the trigger now fail at once with a message, and
+  `agentflow.triggers.run_mqtt(main())` runs a program on a loop that works.
+
+### Added
+
+- `qos=` and `tls_context=` on `MQTTTrigger` and `MQTTDaemon`; reconnect backoff settings on
+  `MQTTTrigger`.
+
 ### Changed
 
+- **`MQTTDaemon` debounces alarms** (decision 6, MQTT-2). Per topic, a new alarm fires at once
+  and a sustained one at most once per `cooldown_s` (default 30). At most `max_concurrent`
+  handlers run at once (default 5); an alarm that arrives while full is skipped and retried on
+  the next message. 500 messages of the same low-battery state used to start 500 pipelines.
+  Restore the old behaviour with `cooldown_s=0, max_concurrent=None`.
 - **Breaking: an unpriced model with `budget_usd` set raises `PipelineError`** before the
   first call (COST-4). A budget that cannot be measured is not a budget. Migration for local
   models: `register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`. Without a budget

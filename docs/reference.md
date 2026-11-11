@@ -116,4 +116,6 @@ change or disappear in any release.
 
 ::: agentflow.triggers.MQTTDaemon
 
+::: agentflow.triggers.run_mqtt
+
 ::: agentflow.swarm_routing.DynamicSupervisorAgent

@@ -471,7 +471,7 @@ Run pipelines as continuous edge services listening to sensor topics (requires `
 
 ```python
 from pydantic import BaseModel
-from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy
+from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy, run_mqtt
 
 class MachineTelemetry(BaseModel):
     rpm: float
@@ -491,10 +491,17 @@ daemon = MQTTDaemon(
     topic="factory/machines/+/telemetry",
     policy=policy,
     handler=handle_telemetry_incident,  # runs asynchronously without blocking MQTT listener
+    cooldown_s=30,      # a sustained alarm fires once, then at most every 30 s
+    max_concurrent=5,   # at most 5 handlers (pipeline runs) in flight
 )
 
-await daemon.serve()
+run_mqtt(daemon.serve())   # like asyncio.run, but on a loop aiomqtt supports on Windows
 ```
+
+A message that is not a JSON object is skipped without dropping the connection, a
+lost broker connection reconnects with backoff, and `qos=` and `tls_context=` are
+passed to the broker. `MQTTTrigger` reconnects the same way, so `Pipeline.serve()`
+keeps running through a broker restart.
 
 ### Performance & Cost Expectations
 
