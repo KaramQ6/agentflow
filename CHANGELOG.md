@@ -34,6 +34,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   default Proactor loop. The daemon and the trigger now fail at once with a message, and
   `agentflow.triggers.run_mqtt(main())` runs a program on a loop that works.
 
+- **Sandbox: code written by a model could read the host's secrets.** `SubprocessSandbox`
+  passed the whole host environment, API keys included, to the code it ran. It now passes
+  only `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `TMPDIR` and `LANG`.
+- **Sandbox: C++ in Docker never worked.** The default image `gcc:14-alpine` does not exist
+  (SBX-1), and Docker mounts `/tmp` noexec by default, so a compiled binary could not run
+  even with a valid image. The image is now `gcc:14` and `/tmp` is an exec tmpfs.
+- **Sandbox containers run as `nobody` with a 64-process cap** (fork bombs stop there).
+  Verified against a real Docker daemon: uid 65534, `pids.max` 64, no network, no host
+  variables.
+- The sandbox module docstring imported `sandboxed_tool` from `agentflow`, where it is not
+  exported (SBX-2). It now imports from `agentflow.sandbox`.
+
 ### Added
 
 - `qos=` and `tls_context=` on `MQTTTrigger` and `MQTTDaemon`; reconnect backoff settings on

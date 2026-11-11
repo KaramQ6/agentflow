@@ -7,7 +7,8 @@ isolated environment with resource limits.
 
 Usage::
 
-    from agentflow import sandboxed_tool, Agent
+    from agentflow import Agent
+    from agentflow.sandbox import sandboxed_tool
 
     @sandboxed_tool(language="python", timeout=5)
     async def run_python(code: str) -> str:
@@ -61,6 +62,15 @@ class SandboxTimeoutError(SandboxError):
     """Raised when sandboxed code exceeds its timeout."""
 
 
+# What a child process needs to start and find its tools. Everything else in the host
+# environment, API keys first, stays out of reach of the code being run.
+_ENV_ALLOWLIST = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "LANG")
+
+
+def _minimal_env() -> dict[str, str]:
+    return {name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ}
+
+
 def _create_runner_script(language: str, code: str) -> list[str]:
     """Build the shell command for a given language and code payload."""
     if language == "python":
@@ -110,7 +120,7 @@ class DockerSandbox:
     """
 
     DEFAULT_PYTHON_IMAGE = "python:3.12-alpine"
-    DEFAULT_CPP_IMAGE = "gcc:14-alpine"
+    DEFAULT_CPP_IMAGE = "gcc:14"  # there is no gcc alpine tag on Docker Hub
     DEFAULT_MEMORY = "128m"
     DEFAULT_CPU_QUOTA = 50000  # 0.5 CPU
     DEFAULT_TIMEOUT = 10
@@ -199,9 +209,12 @@ class DockerSandbox:
                 cpu_quota=self._cpu_quota,
                 network_mode="none" if self._network_disabled else None,
                 read_only=True,
-                tmpfs={"/tmp": ""},
+                # Docker mounts tmpfs noexec by default; the C++ path runs its binary from /tmp.
+                tmpfs={"/tmp": "rw,exec,nosuid,size=64m,mode=1777"},
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges"],
+                user="65534:65534",  # nobody: untrusted code never runs as root
+                pids_limit=64,  # a fork bomb hits this instead of the host
             )
             return await self._wait_for_container(container, timeout)
         finally:
@@ -301,6 +314,7 @@ class SubprocessSandbox:
             code,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_minimal_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -344,6 +358,7 @@ class SubprocessSandbox:
                 gpp, "-std=c++17", "-O2", "-o", exe, src,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_minimal_env(),
             )
             _, compile_stderr = await asyncio.wait_for(
                 compile_proc.communicate(), timeout=30
@@ -360,6 +375,7 @@ class SubprocessSandbox:
                 exe,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_minimal_env(),
             )
             stdout, run_stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return {
