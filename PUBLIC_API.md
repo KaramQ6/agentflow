@@ -46,6 +46,9 @@ Covered semantics (not just names):
   (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
   only when `budget_usd` is set, because a budget must be measurable
   (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- `LLM.generate` is the one retry layer, for transient errors only. `AgentResult.metadata`
+  carries `finish_reason`, and `truncated` when a reply was cut off; an empty cut-off reply
+  raises. *Changed in 0.8.0.*
 - Tool arguments are validated strictly: unknown arguments and non-finite numbers are
   refused. At `max_tool_iterations` the agent makes one last call without tools; if that
   fails, `AgentError` carries `tokens`, `cost` and `trace`. *Changed in 0.8.0.*
@@ -80,6 +83,7 @@ Importable by full path, excluded from the stability contract:
 - `agentflow.swarm_routing` — `DynamicSupervisorAgent`. **Deprecated in 0.8.0,
   removed in 0.9.0** (see below)
 - `agentflow.effects` — effect ledgers (`InMemoryLedger`, `SqliteLedger`)
+- `agentflow.testing` — `ScriptedLLM`, `reply`, `call` for tests
 - `agentflow.contrib.*` — third-party bridges (e.g. `contrib.otel.OTelHooks`)
 
 ## Current deprecations

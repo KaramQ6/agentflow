@@ -108,6 +108,8 @@ change or disappear in any release.
 
 ::: agentflow.contrib.otel.OTelHooks
 
+::: agentflow.testing.ScriptedLLM
+
 ::: agentflow.effects.InMemoryLedger
 
 ::: agentflow.effects.SqliteLedger

@@ -178,7 +178,7 @@ async def test_a_retried_agent_replays_a_completed_write_instead_of_repeating_it
 
     args = {"customer": "ali", "amount": 50}
     llm = Script([
-        _reply(calls=[_call("1", "charge", args)]), RuntimeError("provider down"), RuntimeError("provider down"),
+        _reply(calls=[_call("1", "charge", args)]), RuntimeError("provider down"),
         _reply(calls=[_call("1", "charge", args)]), _reply("done"),
     ])
     pipe = Pipeline(llm=llm, retry_failed_agents=1)
@@ -201,7 +201,7 @@ async def test_after_a_retry_a_second_identical_write_still_runs():
 
     args = {"amount": 5}
     llm = Script([
-        _reply(calls=[_call("1", "charge", args)]), RuntimeError("down"), RuntimeError("down"),
+        _reply(calls=[_call("1", "charge", args)]), RuntimeError("down"),
         _reply(calls=[_call("1", "charge", args)]), _reply(calls=[_call("2", "charge", args)]), _reply("done"),
     ])
     pipe = Pipeline(llm=llm, retry_failed_agents=1)
@@ -268,7 +268,7 @@ async def test_an_agent_that_ran_an_unclassified_tool_is_not_retried():
     async def send_email(to: str) -> str:
         return "sent"
 
-    llm = Script([_reply(calls=[_call("1", "send_email", {"to": "x"})]), RuntimeError("down"), RuntimeError("down"),
+    llm = Script([_reply(calls=[_call("1", "send_email", {"to": "x"})]), RuntimeError("down"),
                   _reply("should never be reached")])
     pipe = Pipeline(llm=llm, retry_failed_agents=2)
     pipe.add(_agent([send_email]))
@@ -285,7 +285,7 @@ async def test_an_agent_that_ran_only_read_tools_is_retried():
     async def get_pose() -> str:
         return "x=1"
 
-    llm = Script([_reply(calls=[_call("1", "get_pose")]), RuntimeError("down"), RuntimeError("down"),
+    llm = Script([_reply(calls=[_call("1", "get_pose")]), RuntimeError("down"),
                   _reply("done")])
     pipe = Pipeline(llm=llm, retry_failed_agents=1)
     pipe.add(_agent([get_pose]))

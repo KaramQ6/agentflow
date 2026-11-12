@@ -168,7 +168,7 @@ async def test_concurrent_resumes_of_one_session_run_the_approved_call_once():
 async def test_retrying_a_failed_resume_does_not_repeat_the_approved_call():
     executed: list = []
     llm = Script([_reply(calls=[_call("1", "arm", {"angle": 90})]),
-                  RuntimeError("down"), RuntimeError("down"),  # the resumed agent fails after the call ran
+                  RuntimeError("down"),  # the resumed agent fails after the call ran (one retry layer: one error)
                   _reply("done")])
     pipe = _pipeline(llm, (_robot(executed), None))
     paused = await pipe.run("go")

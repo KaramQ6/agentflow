@@ -1008,6 +1008,8 @@ class Pipeline:
         # Continue with remaining pipeline levels (supports nested pauses).
         levels = self._resolve_levels()
         try:
+            # The resumed agent's spend is checked like any level's (COST-5).
+            self._check_budget(results)
             tail_output, pause, levels_executed = await self._run_levels(
                 levels=levels,
                 start_level=current_level + 1,

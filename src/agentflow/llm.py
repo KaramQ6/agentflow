@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, cast
 
-from openai import APIError, AsyncOpenAI, RateLimitError
+from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 
 from ._scope import current_scope, record_spend
@@ -36,9 +36,13 @@ class LLM:
         model: Model name (e.g. "gpt-4o", "llama-3.3-70b-versatile").
         api_key: API key for the provider.
         base_url: Base URL for the API (default: OpenAI).
-        temperature: Sampling temperature (0.0-2.0).
-        max_tokens: Maximum tokens in response.
-        max_retries: Number of retries on transient failures.
+        temperature: Sampling temperature (0.0-2.0). ``None`` leaves it out of
+            the request, which reasoning models require.
+        max_tokens: Maximum tokens in response. ``None`` leaves it out.
+        max_retries: Retries on transient failures only (connection errors,
+            timeouts, 429 and 5xx). This is the only retry layer: the SDK's own
+            retries are off, and agents add none.
+        timeout: Seconds to wait for one request (default 120).
         retry_base_delay: Base seconds for exponential backoff (default 1.0).
         retry_jitter: Add random jitter to backoff to avoid thundering herds.
         cache: Optional ResponseCache for deduplicating identical requests.
@@ -50,14 +54,15 @@ class LLM:
         model: str = "gpt-4o-mini",
         api_key: str | None = None,
         base_url: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        temperature: float | None = 0.7,
+        max_tokens: int | None = 4096,
         max_retries: int = 2,
         retry_base_delay: float = 1.0,
         retry_jitter: bool = True,
         cache: ResponseCache | None = None,
         rate_limiter: RateLimiter | None = None,
         context_window: int | None = None,
+        timeout: float = 120.0,
     ):
         self.model = model
         # Tokens the model accepts per request. When set, agents trim whole turns to
@@ -85,7 +90,8 @@ class LLM:
         if base_url:
             kwargs["base_url"] = base_url
 
-        self._client = AsyncOpenAI(**kwargs)
+        # One retry layer (LLM-1): the SDK's own retries would multiply ours.
+        self._client = AsyncOpenAI(max_retries=0, timeout=timeout, **kwargs)
 
     async def generate(
         self,
@@ -140,7 +146,14 @@ class LLM:
                 # the (informational) token counts from the original call.
                 return LLMResponse(**{**cached, "cached": True, "cost": 0.0})
 
-        params: dict[str, Any] = dict(extra)
+        params: dict[str, Any] = {}
+        effective_temperature = temperature if temperature is not None else self.temperature
+        if effective_temperature is not None:
+            params["temperature"] = effective_temperature
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if effective_max_tokens is not None:
+            params["max_tokens"] = effective_max_tokens
+        params.update(extra)
         if tools:
             params["tools"] = tools
             params["tool_choice"] = tool_choice or "auto"
@@ -148,18 +161,19 @@ class LLM:
         scope = current_scope()
         budget = scope.budget if scope is not None else None
         if budget is None:
-            return await self._request(effective_model, messages, temperature, max_tokens, params,
-                                       use_cache, cache_key)
+            return await self._request(effective_model, messages, params, use_cache, cache_key)
         if not is_priced(effective_model):
             raise budget.block(unpriced_budget_error(effective_model))
+        # Without max_tokens the provider decides; reserve a generous completion.
         reservation = estimate_cost(
-            effective_model, _estimate_prompt_tokens(messages, tools), max_tokens or self.max_tokens
+            effective_model,
+            _estimate_prompt_tokens(messages, tools),
+            effective_max_tokens if effective_max_tokens is not None else _UNBOUNDED_COMPLETION,
         )
         await budget.reserve(reservation)
         billed = 0.0
         try:
-            result = await self._request(effective_model, messages, temperature, max_tokens, params,
-                                         use_cache, cache_key)
+            result = await self._request(effective_model, messages, params, use_cache, cache_key)
             billed = result.cost
             return result
         finally:
@@ -169,69 +183,71 @@ class LLM:
         self,
         effective_model: str,
         messages: list[dict[str, Any]],
-        temperature: float | None,
-        max_tokens: int | None,
         params: dict[str, Any],
         use_cache: bool,
         cache_key: str,
     ) -> LLMResponse:
-        """The provider round trip, with retries on transient errors."""
+        """Retries on transient errors, then pricing, accounting and the cache."""
         start = time.perf_counter()
-        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             # Rate limiting per attempt; acquire outside the try so a failed
             # acquire is never paired with a release in the finally below.
             if self._rate_limiter is not None:
                 await self._rate_limiter.acquire()
             try:
-                response = await self._client.chat.completions.create(
-                    model=effective_model,
-                    messages=cast("list[ChatCompletionMessageParam]", messages),
-                    temperature=temperature if temperature is not None else self.temperature,
-                    max_tokens=max_tokens or self.max_tokens,
-                    **params,
-                )
-                duration = time.perf_counter() - start
-                choice = response.choices[0]
-                usage = response.usage
-                prompt_tokens = usage.prompt_tokens if usage else 0
-                completion_tokens = usage.completion_tokens if usage else 0
-
-                # The response's model id is the one that was actually billed —
-                # providers routinely return a more specific id than requested.
-                warn_if_unpriced(response.model)
-
-                result = LLMResponse(
-                    content=choice.message.content or "",
-                    tokens=usage.total_tokens if usage else 0,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    cost=estimate_cost(response.model, prompt_tokens, completion_tokens),
-                    duration=round(duration, 3),
-                    model=response.model,
-                    cached=False,
-                    tool_calls=_serialize_tool_calls(choice.message.tool_calls),
-                    finish_reason=choice.finish_reason,
-                )
-                record_spend(result.cost, result.tokens)
-
-                # Write to cache (never cache tool-calling turns)
-                if use_cache:
-                    assert self._cache is not None
-                    await self._cache.set(cache_key, result.model_dump(exclude={"cached"}))
-
-                return result
-
-            except (RateLimitError, APIError) as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self._backoff_delay(attempt, e))
-                    continue
+                result = await self._complete(effective_model, messages, params)
+                break
+            except LLMError:
+                raise
+            except Exception as e:
+                if not _transient(e) or attempt == self.max_retries:
+                    raise LLMError(f"LLM call failed after {attempt + 1} attempt(s): {e}") from e
+                await asyncio.sleep(self._backoff_delay(attempt, e))
             finally:
                 if self._rate_limiter is not None:
                     self._rate_limiter.release()
 
-        raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")
+        # The response's model id is the one that was actually billed —
+        # providers routinely return a more specific id than requested.
+        warn_if_unpriced(result.model)
+        cost = result.cost or estimate_cost(result.model, result.prompt_tokens, result.completion_tokens)
+        result = result.model_copy(update={"cost": cost, "duration": round(time.perf_counter() - start, 3)})
+        record_spend(result.cost, result.tokens)
+
+        # Write to cache (never cache tool-calling turns)
+        if use_cache:
+            assert self._cache is not None
+            await self._cache.set(cache_key, result.model_dump(exclude={"cached"}))
+        return result
+
+    async def _complete(
+        self, model: str, messages: list[dict[str, Any]], params: dict[str, Any]
+    ) -> LLMResponse:
+        """One provider round trip, nothing else: no retry, no pricing, no cache.
+
+        The replacement seam. Override it to swap the provider, or use
+        :class:`agentflow.testing.ScriptedLLM`; ``generate()`` keeps caching,
+        budget reservation and accounting around it.
+        """
+        response = await self._client.chat.completions.create(
+            model=model,
+            messages=cast("list[ChatCompletionMessageParam]", messages),
+            **params,
+        )
+        if not response.choices:
+            raise LLMError(f"provider returned no choices for model {model!r}")
+        choice = response.choices[0]
+        usage = response.usage
+        return LLMResponse(
+            content=choice.message.content or "",
+            tokens=usage.total_tokens if usage else 0,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            model=response.model,
+            cached=False,
+            tool_calls=_serialize_tool_calls(choice.message.tool_calls),
+            finish_reason=choice.finish_reason,
+        )
 
     def _backoff_delay(self, attempt: int, error: Exception) -> float:
         """Seconds to wait before the next retry.
@@ -267,12 +283,18 @@ class LLM:
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire()
         try:
+            sampling: dict[str, Any] = {}
+            effective_temperature = temperature if temperature is not None else self.temperature
+            if effective_temperature is not None:
+                sampling["temperature"] = effective_temperature
+            effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+            if effective_max_tokens is not None:
+                sampling["max_tokens"] = effective_max_tokens
             stream = await self._client.chat.completions.create(
                 model=effective_model,
                 messages=cast("list[ChatCompletionMessageParam]", messages),
-                temperature=temperature if temperature is not None else self.temperature,
-                max_tokens=max_tokens or self.max_tokens,
                 stream=True,
+                **sampling,
             )
             async for chunk in stream:
                 if not chunk.choices:
@@ -298,6 +320,16 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+_UNBOUNDED_COMPLETION = 4096  # tokens reserved when max_tokens is None
+
+
+def _transient(error: Exception) -> bool:
+    """Worth retrying: the same request may succeed. A 4xx other than 429 never will."""
+    if isinstance(error, (APIConnectionError, RateLimitError)):  # includes timeouts
+        return True
+    return isinstance(error, APIStatusError) and error.status_code >= 500
 
 
 def _is_loopback(base_url: str | None) -> bool:

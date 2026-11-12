@@ -25,7 +25,6 @@ from .types import AgentResult
 DEFAULT_MAX_TOOL_ITERATIONS = 6
 TOOL_OUTPUT_MAX_CHARS = 5000
 MESSAGES_MAX_LENGTH = 20
-LLM_RETRIES_PER_ITERATION = 1
 MEMORY_SNIPPET_MAX_CHARS = 300
 DEFAULT_OUTPUT_RETRIES = 1
 
@@ -268,7 +267,7 @@ class AgentSpec:
 
         metadata: dict[str, Any] = {}
         if self._tools:
-            content, tokens_used, cost, model_name, trace = await self._run_tool_loop(
+            content, tokens_used, cost, model_name, trace, finish_reason = await self._run_tool_loop(
                 messages, llm, approval_policy=effective_policy
             )
             metadata["model"] = model_name
@@ -285,7 +284,9 @@ class AgentSpec:
             cost = response.cost
             model_name = response.model
             cached = response.cached
+            finish_reason = response.finish_reason
             metadata["model"] = model_name
+        self._check_finish(content, finish_reason, metadata)
 
         # M3: Persist this agent's output back to memory for downstream agents.
         if self._memory is not None and content:
@@ -335,7 +336,8 @@ class AgentSpec:
         repair_tokens = 0
         repair_cost = 0.0
         attempts = max(self._output_retries, 0) + 1
-        conversation = messages
+        # The repair call declares no tools, so it must not replay tool turns (NEW-10).
+        conversation = [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")]
 
         for attempt in range(attempts):
             try:
@@ -387,7 +389,7 @@ class AgentSpec:
         initial_trace: list[dict[str, Any]] | None = None,
         initial_seen_calls: set[tuple[str, str]] | None = None,
         approval_policy: ApprovalPolicy | None = None,
-    ) -> tuple[str, int, float, str, list[dict[str, Any]]]:
+    ) -> tuple[str, int, float, str, list[dict[str, Any]], str | None]:
         """Drive a ReAct-style loop: call the LLM, run any requested tools, repeat.
 
         Features:
@@ -402,7 +404,7 @@ class AgentSpec:
         cost, trace, and seen-calls state.
 
         Returns:
-            (final_content, total_tokens, total_cost, model_name, tool_call_trace)
+            (final_content, total_tokens, total_cost, model_name, tool_call_trace, finish_reason)
         """
         tool_map = {t.name: t for t in self._tools}
         total_tokens = initial_total_tokens
@@ -413,30 +415,20 @@ class AgentSpec:
 
         for iteration in range(start_iteration, self._max_tool_iterations):
             self._fit_context(messages, llm, self._openai_tools)
-            # Per-iteration LLM retry for transient failures.
-            for retry in range(LLM_RETRIES_PER_ITERATION + 1):
-                try:
-                    response = await llm.generate(messages, tools=self._openai_tools)
-                    break
-                except Exception as exc:
-                    if retry == LLM_RETRIES_PER_ITERATION:
-                        raise AgentError(
-                            self.name,
-                            f"LLM call failed after {LLM_RETRIES_PER_ITERATION + 1} iteration-level attempts",
-                            tokens=total_tokens, cost=total_cost, trace=trace,
-                        ) from exc
-                    _log.warning(
-                        "LLM generation retry in agent %s (iteration %d, attempt %d)",
-                        self.name, iteration + 1, retry + 1,
-                    )
-                    await asyncio.sleep(0.5 * (2 ** retry))
+            # No retry here: LLM.generate is the one retry layer (LLM-1).
+            try:
+                response = await llm.generate(messages, tools=self._openai_tools)
+            except Exception as exc:
+                raise AgentError(
+                    self.name, f"LLM call failed: {exc}", tokens=total_tokens, cost=total_cost, trace=trace
+                ) from exc
 
             total_tokens += response.tokens
             total_cost += response.cost
             model_name = response.model
 
             if not response.tool_calls:
-                return response.content, total_tokens, total_cost, model_name, trace
+                return response.content, total_tokens, total_cost, model_name, trace, response.finish_reason
 
             batch = _normalized(response.tool_calls)
             messages.append({"role": "assistant", "content": response.content or None, "tool_calls": batch})
@@ -512,6 +504,20 @@ class AgentSpec:
 
         return await self._final_answer(messages, llm, total_tokens, total_cost, trace)
 
+    def _check_finish(self, content: str, finish_reason: str | None, metadata: dict[str, Any]) -> None:
+        """Make truncation visible (NEW-02): an empty cut-off reply is an error, a partial one is marked."""
+        metadata["finish_reason"] = finish_reason
+        if finish_reason != "length":
+            return
+        if not (content or "").strip():
+            raise AgentError(
+                self.name,
+                "the reply was cut off by max_tokens before any answer (finish_reason=length); "
+                "raise max_tokens, or lower reasoning effort on a thinking model",
+            )
+        metadata["truncated"] = True
+        _log.warning("Reply of agent %s was cut off by max_tokens; the output is incomplete", self.name)
+
     def _truncate(self, output: str) -> str:
         return _truncate_output(output, self._tool_output_max_chars)
 
@@ -568,7 +574,7 @@ class AgentSpec:
         total_tokens: int,
         total_cost: float,
         trace: list[dict[str, Any]],
-    ) -> tuple[str, int, float, str, list[dict[str, Any]]]:
+    ) -> tuple[str, int, float, str, list[dict[str, Any]], str | None]:
         """At the iteration cap, ask once more without tools instead of discarding the work (NEW-01)."""
         final = [*messages, {"role": "user", "content": _FINAL_ANSWER_PROMPT}]
         limit = f"exceeded max_tool_iterations={self._max_tool_iterations} without a final answer"
@@ -581,7 +587,7 @@ class AgentSpec:
         total_cost += response.cost
         if not (response.content or "").strip():
             raise AgentError(self.name, limit, tokens=total_tokens, cost=total_cost, trace=trace)
-        return response.content, total_tokens, total_cost, response.model, trace
+        return response.content, total_tokens, total_cost, response.model, trace, response.finish_reason
 
     async def _after(
         self,
@@ -740,7 +746,7 @@ class AgentSpec:
                     cid, tname, targs, output = await self._execute_single_tool(call, tool_map)
                     answer(cid, tname, targs, self._truncate(output))
 
-        content, tokens_used, cost, model_name, final_trace = await self._run_tool_loop(
+        content, tokens_used, cost, model_name, final_trace, finish_reason = await self._run_tool_loop(
             messages,
             llm,
             start_iteration=pause_data["iterations_used"] + 1,
@@ -763,6 +769,7 @@ class AgentSpec:
             "model": model_name,
             "tool_calls": final_trace,
         }
+        self._check_finish(content, finish_reason, metadata)
         data: dict[str, Any] | None = None
         if self._output_schema is not None:
             data, content, repair_tokens, repair_cost = await self._validate_output(

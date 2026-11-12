@@ -52,6 +52,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   call twice on purpose) still runs (NEW-14). A call that started and never finished raises
   `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
   the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **One retry layer.** The OpenAI SDK retried on its own and the agent loop retried again on
+  top of `LLM.max_retries`: a bad API key made 18 HTTP calls and a 500 made 9 where 3 were
+  promised (LLM-1). The SDK's retries are off, the agent adds none, and `LLM` retries only
+  what can succeed: connection errors, timeouts, 429 and 5xx.
+- **A reply cut off by `max_tokens` is visible** (NEW-02). An empty one raises `AgentError`;
+  a partial one sets `metadata["truncated"]`. `metadata["finish_reason"]` is always recorded.
+  On a real thinking model, a 64-token budget produced no answer at all.
+- **An empty `choices` list raises `LLMError`**, not `IndexError` (LLM-4).
+- **Schema repair no longer replays tool messages without declaring tools** (NEW-10).
+- **A resumed agent's spend is checked against the budget** (COST-5).
 - **Tools stop with their agent.** On a timeout, cancellation, error or pause, tool calls
   still running are cancelled and awaited, instead of finishing unobserved (LOOP-3: on real
   ROS 2 a sibling `move` streamed 41 commands over 3.9 s after a cancel). A sync tool cannot
@@ -90,6 +100,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
   `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
   `InMemoryLedger` and `SqliteLedger`.
+- `agentflow.testing` (opt-in): `ScriptedLLM`, `reply()` and `call()` run a pipeline against
+  a script at zero cost. It replaces only the provider round trip (`LLM._complete`, the new
+  replacement seam), so caching, budget reservation and accounting run as in production.
+- `LLM(temperature=None, max_tokens=None)` leave the parameter out of the request, which
+  reasoning models require (LLM-3), and `LLM(timeout=...)`.
 - `LLM(context_window=...)`: agents trim whole turns to fit the window and refuse a request
   that cannot fit, instead of letting a local server truncate it silently (NEW-09: Ollama cut
   two real requests by 21 to 22% without an error). An `LLM` pointed at a loopback address
@@ -114,6 +129,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
   (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
   `SupervisorAgent`. About 320 lines leave in 0.9.0.
+- **`LLM(timeout=120)`** instead of the SDK's 600 s (decision 5). On a real local 4B model, the
+  slowest of 493 calls took 34 s. Migration for very slow models: `LLM(timeout=600)`.
+- **An `LLM` subclass that overrides `generate` bypasses retries, pricing and the budget.**
+  Override `_complete` instead.
 - **Breaking: tool arguments are strict.** An unknown argument, or NaN or Infinity in a number,
   is now refused with an error observation the model can correct, instead of being dropped or
   passed to the tool (NEW-05, NEW-06). A speed limit the model asked for used to vanish

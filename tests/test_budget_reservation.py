@@ -179,3 +179,30 @@ async def test_a_budget_stop_is_not_retried():
     assert llm._client.chat.completions.create.await_count == 0, (
         "the first reservation (about $0.11) does not fit $0.05, and retrying cannot change that"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_agents_spend_is_checked_against_the_budget():
+    from agentflow import ApprovalPolicy, InMemoryContext
+    from agentflow.testing import ScriptedLLM, call, reply
+
+    @tool(effect="write")
+    async def danger() -> str:
+        return "done"
+
+    @Agent(name="a", role="r", tools=[danger])
+    async def a(task, context):
+        return task
+
+    # The reply after the resume bills far more than its reservation predicted.
+    expensive = reply("finished").model_copy(update={"cost": 5.0})
+    llm = ScriptedLLM([reply(calls=[call("1", "danger")]), expensive], model=MODEL, max_tokens=100)
+    pipe = Pipeline(llm=llm, memory=InMemoryContext(), budget_usd=0.5,
+                    approval_policy=ApprovalPolicy(blocked_tools=["danger"]))
+    pipe.add(a)
+    paused = await pipe.run("go")
+
+    with pytest.raises(BudgetExceededError) as caught:
+        await pipe.resume(paused.pause_info["session_id"], "ok", approved=True)
+
+    assert caught.value.spent_usd > 0.5, "an overshoot after resume must still stop the run (COST-5)"
