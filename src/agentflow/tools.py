@@ -23,7 +23,7 @@ import json
 from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import create_model
+from pydantic import ConfigDict, create_model
 
 from .exceptions import ToolError
 
@@ -161,7 +161,10 @@ def _build_args_model(func: Callable[..., Any], tool_name: str) -> Any:
         annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
         default = ... if param.default is inspect.Parameter.empty else param.default
         fields[pname] = (annotation, default)
-    return create_model(f"{tool_name}_Args", **fields)
+    # Unknown arguments and NaN/Infinity are refused, never dropped or passed on:
+    # a speed limit silently ignored, or an infinite speed, reaches an actuator.
+    strict = ConfigDict(extra="forbid", allow_inf_nan=False)
+    return create_model(f"{tool_name}_Args", __config__=strict, **fields)
 
 
 def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:

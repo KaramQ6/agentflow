@@ -168,6 +168,10 @@ llm = LLM(
 )
 ```
 
+Declare the context the server was started with, so agents trim to fit instead of
+the server cutting requests silently: `LLM(..., context_window=8192)` (Ollama's
+`num_ctx`; it defaults to 4096 on GPUs under 24 GiB).
+
 A budget needs a price for every model, so a local model is declared free:
 `register_price("llama3.2", 0, 0)`. Without `budget_usd` no price is needed.
 

@@ -85,7 +85,13 @@ See [ADR 0004](../adr/0004-effect-ledger-for-side-effecting-tools.md) and
 
 If a tool's arguments fail validation or the function raises, the error is fed
 back to the model as the tool result (prefixed `Error:`) so it can recover,
-rather than crashing the pipeline. A `ToolError` is raised only when you call a
+rather than crashing the pipeline. Validation is strict: an argument the tool
+does not declare, or NaN or Infinity in a number, is refused rather than dropped
+or passed on.
+
+Tool output longer than `tool_output_max_chars` (default 5000) is truncated with
+a marker. When the agent reaches `max_tool_iterations`, it gets one last call
+without tools to answer from what it found. A `ToolError` is raised only when you call a
 tool directly via `Tool.acall`.
 
 See the full API in the [reference](../reference.md).

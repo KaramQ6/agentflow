@@ -52,6 +52,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   call twice on purpose) still runs (NEW-14). A call that started and never finished raises
   `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
   the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **Tools stop with their agent.** On a timeout, cancellation, error or pause, tool calls
+  still running are cancelled and awaited, instead of finishing unobserved (LOOP-3: on real
+  ROS 2 a sibling `move` streamed 41 commands over 3.9 s after a cancel). A sync tool cannot
+  be cancelled inside its thread; it is now named in a warning (NEW-07).
+- **The iteration cap no longer throws the work away.** At `max_tool_iterations` the model
+  gets one last call without tools to answer from what it found (NEW-01: 19 of 19 real review
+  runs lost everything, 3.4 million tokens). If that fails too, `AgentError` carries
+  `tokens`, `cost` and the tool `trace`.
+- **Trimming keeps whole turns** (LOOP-2: 6 of 30 real requests sent tool results without
+  their call). An assistant message and its tool results are dropped together.
+- **Results stay with their call** when two calls share an id (NEW-03), and
+  `arguments: null` means no arguments instead of a crash (NEW-04).
 - **Human approval is decided per call.** Rejecting one blocked call used to let the other
   blocked call in the same reply run anyway (HITL-1: on real ROS 2 the second `move` sent 10
   commands after the rejection, 5/5). A rejection now stops the rest of the reply, reported
@@ -78,6 +90,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
   `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
   `InMemoryLedger` and `SqliteLedger`.
+- `LLM(context_window=...)`: agents trim whole turns to fit the window and refuse a request
+  that cannot fit, instead of letting a local server truncate it silently (NEW-09: Ollama cut
+  two real requests by 21 to 22% without an error). An `LLM` pointed at a loopback address
+  without a `context_window` logs a warning.
+- `Agent(tool_output_max_chars=...)`, which was a hidden constant (NEW-08).
+- `AgentError.tokens`, `.cost` and `.trace`.
 - `Pipeline.resume(..., on_in_doubt="raise" | "retry" | "skip")` and
   `pause_info["resumable"]`, which is `False` when the pipeline has an approval policy but no
   memory backend (HITL-7; the constructor also warns).
@@ -96,6 +114,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
   (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
   `SupervisorAgent`. About 320 lines leave in 0.9.0.
+- **Breaking: tool arguments are strict.** An unknown argument, or NaN or Infinity in a number,
+  is now refused with an error observation the model can correct, instead of being dropped or
+  passed to the tool (NEW-05, NEW-06). A speed limit the model asked for used to vanish
+  silently. Migration: declare every argument the tool accepts.
+- **The iteration cap makes one more, tool-free call**, which is billed like any other.
 - **Pause state is stored in a new place and format.** A run paused by 0.7.x cannot be resumed
   by 0.8.0; resume or abandon paused runs before upgrading.
 - **Breaking: an agent that ran a tool without `effect` is not retried** by

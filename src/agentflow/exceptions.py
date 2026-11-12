@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .types import PipelineResult
@@ -19,8 +19,19 @@ class LLMError(AgentFlowError):
 class AgentError(AgentFlowError):
     """Raised when an agent execution fails."""
 
-    def __init__(self, agent_name: str, message: str):
+    def __init__(
+        self,
+        agent_name: str,
+        message: str,
+        *,
+        tokens: int = 0,
+        cost: float = 0.0,
+        trace: list[dict[str, Any]] | None = None,
+    ):
         self.agent_name = agent_name
+        self.tokens = tokens  # usage of the failed agent, when known
+        self.cost = cost
+        self.trace = trace or []  # tool calls it made before failing
         super().__init__(f"Agent '{agent_name}' failed: {message}")
 
 

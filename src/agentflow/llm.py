@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import time
 from collections.abc import AsyncGenerator
@@ -20,6 +21,9 @@ from .types import LLMResponse
 if TYPE_CHECKING:
     from .cache import ResponseCache
     from .rate_limiter import RateLimiter
+
+
+_log = logging.getLogger("agentflow.llm")
 
 
 class LLM:
@@ -53,8 +57,20 @@ class LLM:
         retry_jitter: bool = True,
         cache: ResponseCache | None = None,
         rate_limiter: RateLimiter | None = None,
+        context_window: int | None = None,
     ):
         self.model = model
+        # Tokens the model accepts per request. When set, agents trim whole turns to
+        # fit and refuse a request that cannot fit, instead of letting a local server
+        # truncate it silently.
+        self.context_window = context_window
+        if context_window is None and _is_loopback(base_url):
+            _log.warning(
+                "LLM at %s has no context_window. Local servers such as Ollama cut a request "
+                "that exceeds their context without an error. Pass context_window= (e.g. the "
+                "model's num_ctx) so agents trim to fit.",
+                base_url,
+            )
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_retries = max_retries
@@ -282,6 +298,14 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_loopback(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    from urllib.parse import urlparse
+
+    return (urlparse(base_url).hostname or "") in {"localhost", "127.0.0.1", "::1"}
 
 
 def unpriced_budget_error(model: str) -> PipelineError:
