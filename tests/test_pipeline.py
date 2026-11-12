@@ -247,8 +247,8 @@ async def test_error_wins_over_sibling_pause():
         await pipe.run("task")
 
     # The discarded pause must not have been persisted.
-    assert "__hitl_pipeline" not in saves
-    assert "__hitl_agent" not in saves
+    assert "pipeline" not in saves
+    assert "pauses" not in saves
 
 
 def test_cycle_error_names_members():

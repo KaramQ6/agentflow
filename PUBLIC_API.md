@@ -46,6 +46,10 @@ Covered semantics (not just names):
   (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
   only when `budget_usd` is set, because a budget must be measurable
   (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- HITL: each blocked call is approved on its own; a rejection stops the rest of that
+  reply's tool calls; an approved call runs at most once across `resume()` calls, and
+  `resume(on_in_doubt=...)` decides what happens to one that never recorded a result.
+  *Changed in 0.8.0.*
 - `tool(effect=...)`: `"read"` tools may repeat and run concurrently; `"write"` tools run
   one at a time in the model's order and at most once per occurrence in a run; an agent
   that ran a tool without `effect` is not retried. See ADR 0006. *Added in 0.8.0.*

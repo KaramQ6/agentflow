@@ -19,6 +19,7 @@ from .exceptions import BudgetExceededError
 
 if TYPE_CHECKING:
     from .effects import EffectLedger
+    from .hitl import ApprovalPolicy
 
 
 @dataclass
@@ -88,6 +89,7 @@ class RunScope:
     discarded: Spend = field(default_factory=Spend)
     budget: Budget | None = None
     effect_ledger: EffectLedger | None = None
+    policy: ApprovalPolicy | None = None  # reaches supervisor workers too (HITL-9)
 
 
 _scope: ContextVar[RunScope | None] = ContextVar("agentflow_run_scope", default=None)
@@ -101,6 +103,11 @@ def new_run_id() -> str:
 
 def current_scope() -> RunScope | None:
     return _scope.get()
+
+
+def run_policy() -> ApprovalPolicy | None:
+    scope = _scope.get()
+    return scope.policy if scope is not None else None
 
 
 @contextmanager

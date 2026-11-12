@@ -52,6 +52,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   call twice on purpose) still runs (NEW-14). A call that started and never finished raises
   `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
   the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **Human approval is decided per call.** Rejecting one blocked call used to let the other
+  blocked call in the same reply run anyway (HITL-1: on real ROS 2 the second `move` sent 10
+  commands after the rejection, 5/5). A rejection now stops the rest of the reply, reported
+  to the model as `[NOT RUN]`, and approving one call no longer approves the next: a later
+  blocked call pauses again.
+- **An approved call runs once.** Two concurrent `resume()` calls for one session used to run
+  the approved tool twice (HITL-2); the second is now refused with `PipelineError`. A
+  `resume()` retried after a failure used to run it again (HITL-3); the result is now recorded
+  as soon as the call returns and reused. A call that started and never recorded a result
+  raises `EffectUncertainError` unless `resume(..., on_in_doubt="skip" | "retry")` says what
+  to do.
+- **Two agents that pause in the same level are both resumed** before their dependents run.
+  The second pause used to be lost and the dependents ran without it (HITL-4).
+- **Pause state no longer leaks into agent prompts** (HITL-5): it lives in its own memory
+  namespace. A `datetime` (or any other schema type) in a completed sibling's output no longer
+  breaks persistence (HITL-6). Every tool call in the paused reply is answered after a resume,
+  so the next request stays valid for the provider (HITL-8).
+- **Supervisor workers obey the approval policy** (HITL-9). A blocked tool called by a worker
+  is refused with a `[BLOCKED]` observation, since a worker cannot pause the pipeline.
 - **Re-reading a sensor is no longer rejected** for `@tool(effect="read")` (LOOP-1).
 
 ### Added
@@ -59,6 +78,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
   `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
   `InMemoryLedger` and `SqliteLedger`.
+- `Pipeline.resume(..., on_in_doubt="raise" | "retry" | "skip")` and
+  `pause_info["resumable"]`, which is `False` when the pipeline has an approval policy but no
+  memory backend (HITL-7; the constructor also warns).
 - `qos=` and `tls_context=` on `MQTTTrigger` and `MQTTDaemon`; reconnect backoff settings on
   `MQTTTrigger`.
 
@@ -74,6 +96,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
   (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
   `SupervisorAgent`. About 320 lines leave in 0.9.0.
+- **Pause state is stored in a new place and format.** A run paused by 0.7.x cannot be resumed
+  by 0.8.0; resume or abandon paused runs before upgrading.
 - **Breaking: an agent that ran a tool without `effect` is not retried** by
   `retry_failed_agents` (decision 4), because a retry could repeat that tool. The error
   names the tools. Migration: mark each tool `effect="read"` or `effect="write"`.

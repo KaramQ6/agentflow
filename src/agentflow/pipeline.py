@@ -10,7 +10,10 @@ import logging
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Coroutine
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic_core import to_jsonable_python
 
 from ._scope import Budget, RunScope, Spend, current_scope, new_run_id, run_scope, tracking
 from .agent import AgentLike, AgentSpec
@@ -122,6 +125,39 @@ def _budget_stop() -> Exception | None:
     return scope.budget.blocked if scope is not None and scope.budget is not None else None
 
 
+# Pause state lives in its own memory namespace, never in the one agents read
+# their context from (HITL-5).
+_HITL_SUFFIX = "::agentflow-hitl"
+InDoubt = Literal["raise", "retry", "skip"]
+
+
+def hitl_session(session_id: str) -> str:
+    """The memory namespace that holds the pause state of *session_id*."""
+    return session_id + _HITL_SUFFIX
+
+
+def _dumps(value: Any) -> str:
+    # to_jsonable_python: datetimes and other schema types survive (HITL-6).
+    return json.dumps(value, default=to_jsonable_python)
+
+
+@dataclass
+class _PausedRun:
+    """What resume() loads: the run so far, the pauses still open, and call claims."""
+
+    state: dict[str, Any]
+    pauses: list[dict[str, Any]]
+    claims: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _Decision:
+    session_id: str
+    feedback: str
+    approved: bool
+    on_in_doubt: InDoubt
+
+
 def _discarded_state() -> tuple[float, int]:
     scope = current_scope()
     return (scope.discarded.cost, scope.discarded.tokens) if scope is not None else (0.0, 0)
@@ -224,6 +260,12 @@ class Pipeline:
         self._max_concurrency = max_concurrency
         self._effect_ledger = effect_ledger
         self._warned_volatile_effects = False
+        self._resuming: set[str] = set()
+        if approval_policy is not None and memory is None:
+            _logger.warning(
+                "Pipeline has an approval_policy but no memory backend: a run that pauses "
+                "for approval can never be resumed (pause_info['resumable'] is False)."
+            )
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
         self._hooks = hooks
@@ -377,12 +419,13 @@ class Pipeline:
         self._warn_if_effects_are_volatile()
         ledger = self._effect_ledger if self._effect_ledger is not None else InMemoryLedger()
         if self._budget_usd is None:
-            return RunScope(run_id, effect_ledger=ledger)
+            return RunScope(run_id, effect_ledger=ledger, policy=self._approval_policy)
         # A duck-typed LLM without a model id is checked per call instead, where it bills.
         model = getattr(self._llm, "model", None)
         if model and not is_priced(model):
             raise unpriced_budget_error(model)
-        return RunScope(run_id, budget=Budget(self._budget_usd, spent), effect_ledger=ledger)
+        return RunScope(run_id, budget=Budget(self._budget_usd, spent), effect_ledger=ledger,
+                        policy=self._approval_policy)
 
     def _warn_if_effects_are_volatile(self) -> None:
         """A paused run can resume in another process; an in-memory ledger cannot follow it."""
@@ -485,13 +528,13 @@ class Pipeline:
         run_id: str,
         task: str,
         level_index: int,
-        pause_exc: PauseExecution,
+        pauses: list[PauseExecution],
         to_run: list[_PipelineNode],
         level_results: list[Any],
         results: dict[str, AgentResult],
         context: dict[str, Any],
     ) -> str:
-        """Collect completed agent results and persist HITL pause state to memory.
+        """Collect completed agent results and persist every pause of the level.
 
         Returns the ``last_output`` from the most-recently-completed agent.
         Results and context dicts are mutated in-place.
@@ -504,26 +547,79 @@ class Pipeline:
                 last_output = r.output
 
         if self._memory is not None:
-            pipeline_state = json.dumps(
-                {
-                    "task": task,
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "results": {k: v.model_dump() for k, v in results.items()},
-                    "context": context,
-                    "current_level": level_index,
-                    "paused_agent_name": pause_exc.agent_name,
-                    "discarded_spend": _discarded_state(),
-                }
+            state = {
+                "task": task,
+                "run_id": run_id,
+                "session_id": session_id,
+                "current_level": level_index,
+                "discarded_spend": _discarded_state(),
+            }
+            await self._save_paused(
+                session_id,
+                _PausedRun(state, [p.as_dict() for p in pauses]),
+                results,
+                context,
             )
-            await self._memory.save_context(
-                session_id, "__hitl_pipeline", pipeline_state
-            )
-            await self._memory.save_context(
-                session_id, "__hitl_agent", json.dumps(pause_exc.as_dict())
-            )
-
         return last_output
+
+    async def _save_paused(
+        self, session_id: str, paused: _PausedRun, results: dict[str, AgentResult], context: dict[str, Any]
+    ) -> None:
+        assert self._memory is not None
+        paused.state["results"] = {k: v.model_dump(mode="json") for k, v in results.items()}
+        paused.state["context"] = context
+        namespace = hitl_session(session_id)
+        await self._memory.save_context(namespace, "pipeline", _dumps(paused.state))
+        await self._memory.save_context(namespace, "pauses", _dumps(paused.pauses))
+        await self._memory.save_context(namespace, "claims", _dumps(paused.claims))
+
+    async def _load_paused(self, session_id: str) -> _PausedRun:
+        assert self._memory is not None
+        ctx = await self._memory.load_context(hitl_session(session_id))
+        if not ctx.get("pipeline") or not ctx.get("pauses"):
+            raise PipelineError(f"No paused state found for session '{session_id}'")
+
+        def load(value: Any) -> Any:
+            return json.loads(value) if isinstance(value, str) else value
+
+        return _PausedRun(load(ctx["pipeline"]), load(ctx["pauses"]), load(ctx.get("claims") or "{}"))
+
+    async def _clear_paused(self, session_id: str) -> None:
+        assert self._memory is not None
+        for key in ("pipeline", "pauses", "claims"):
+            await self._memory.delete_key(hitl_session(session_id), key)
+
+    async def _claim_approved_call(
+        self, decision: _Decision, paused: _PausedRun
+    ) -> tuple[str | None, Any]:
+        """Run an approved call at most once across resumes (HITL-2, HITL-3).
+
+        Returns ``(prior_output, on_executed)``: a recorded or skipped result to reuse
+        instead of running the call, or a callback that records the result once it ran.
+        """
+        if not decision.approved:
+            return None, None
+        pause = paused.pauses[0]
+        call_id = pause["tool_call_id"]
+        claim = paused.claims.get(call_id)
+        if claim is not None and claim["status"] == "done":
+            return claim["result"], None
+        if claim is not None and claim["status"] == "pending":
+            if decision.on_in_doubt == "raise":
+                raise EffectUncertainError(pause["agent_name"], pause["tool_name"], call_id)
+            if decision.on_in_doubt == "skip":
+                return "[IN DOUBT] this call may already have run; the operator chose to continue.", None
+        namespace = hitl_session(decision.session_id)
+        assert self._memory is not None
+        paused.claims[call_id] = {"status": "pending", "result": ""}
+        await self._memory.save_context(namespace, "claims", _dumps(paused.claims))
+
+        async def record(output: str) -> None:
+            assert self._memory is not None
+            paused.claims[call_id] = {"status": "done", "result": output}
+            await self._memory.save_context(namespace, "claims", _dumps(paused.claims))
+
+        return None, record
 
     def _check_budget(self, results: dict[str, AgentResult]) -> None:
         """Raise BudgetExceededError if accumulated cost passed ``budget_usd``."""
@@ -567,6 +663,7 @@ class Pipeline:
                     "tool_name": pause.tool_name,
                     "tool_arguments": pause.tool_arguments,
                     "session_id": session_id,
+                    "resumable": self._memory is not None,
                 }
                 if pause is not None
                 else None
@@ -654,11 +751,10 @@ class Pipeline:
             level_results = await _gather_level(level_coros)
 
             first_error: tuple[_PipelineNode, BaseException] | None = None
-            pause: PauseExecution | None = None
+            pauses: list[PauseExecution] = []
             for node, result in zip(to_run, level_results, strict=False):
                 if isinstance(result, PauseExecution):
-                    if pause is None:
-                        pause = result
+                    pauses.append(result)
                 elif isinstance(result, asyncio.CancelledError):
                     # Cancelled by the fail-fast above; the agent that actually
                     # failed is another entry in this same list.
@@ -668,11 +764,11 @@ class Pipeline:
 
             if first_error is not None:
                 node, error = first_error
-                if pause is not None:
+                for discarded_pause in pauses:
                     _logger.warning(
                         "Discarding HITL pause from agent '%s': sibling agent "
                         "'%s' failed in the same level",
-                        pause.agent_name,
+                        discarded_pause.agent_name,
                         node.agent.name,
                     )
                 if self._hooks is not None:
@@ -682,12 +778,12 @@ class Pipeline:
                     emitter.emit("agent_error", agent=node.agent.name, error=str(error))
                 raise error
 
-            if pause is not None:
+            if pauses:
                 persisted_output = await self._persist_pause_state(
-                    session_id, run_id, task, level_index, pause,
+                    session_id, run_id, task, level_index, pauses,
                     to_run, level_results, results, context,
                 )
-                return persisted_output or last_output, pause, level_index
+                return persisted_output or last_output, pauses[0], level_index
 
             for node, result in zip(to_run, level_results, strict=False):
                 assert isinstance(result, AgentResult)
@@ -775,7 +871,12 @@ class Pipeline:
         return pipeline_result
 
     async def resume(
-        self, session_id: str, human_feedback: str, approved: bool
+        self,
+        session_id: str,
+        human_feedback: str,
+        approved: bool,
+        *,
+        on_in_doubt: InDoubt = "raise",
     ) -> PipelineResult:
         """Resume a pipeline paused by the HITL approval mechanism.
 
@@ -790,7 +891,13 @@ class Pipeline:
                             *approved* is ``False``, allowing the agent to
                             self-correct.
             approved: ``True`` to execute the pending tool call; ``False`` to
-                      reject it and feed *human_feedback* to the agent.
+                      reject it and feed *human_feedback* to the agent. A rejection
+                      also stops the rest of that reply's tool calls. Approving one
+                      call never approves the next: a later blocked call pauses again.
+            on_in_doubt: What to do when an earlier resume started this approved
+                      call and never recorded its result (a crash). ``"raise"``
+                      (default) raises :class:`EffectUncertainError`; ``"skip"``
+                      continues without running it; ``"retry"`` runs it again.
 
         Returns:
             A ``PipelineResult`` with ``status="completed"`` and all agent
@@ -805,48 +912,38 @@ class Pipeline:
         if self._memory is None:
             raise PipelineError("Cannot resume without a memory backend configured")
 
-        ctx = await self._memory.load_context(session_id)
-        pipeline_raw = ctx.get("__hitl_pipeline")
-        agent_raw = ctx.get("__hitl_agent")
+        if on_in_doubt not in ("raise", "retry", "skip"):
+            raise ValueError(f"on_in_doubt must be 'raise', 'retry' or 'skip', got {on_in_doubt!r}")
+        if session_id in self._resuming:
+            raise PipelineError(f"resume() is already running for session '{session_id}'")
+        self._resuming.add(session_id)
+        try:
+            paused = await self._load_paused(session_id)
+            state = paused.state
+            discarded = state.get("discarded_spend", (0.0, 0))
+            spent_before = discarded[0] + sum(r["cost"] for r in state["results"].values())
+            scope = self._new_scope(state["run_id"], spent=spent_before)
+            scope.discarded.add(*discarded)
+            with run_scope(scope):
+                return await self._resume(
+                    _Decision(session_id, human_feedback, approved, on_in_doubt), paused, wall_start
+                )
+        finally:
+            self._resuming.discard(session_id)
 
-        if not pipeline_raw or not agent_raw:
-            raise PipelineError(
-                f"No paused state found for session '{session_id}'"
-            )
-
-        pipeline_state: dict[str, Any] = (
-            json.loads(pipeline_raw) if isinstance(pipeline_raw, str) else pipeline_raw
-        )
-        pause_data: dict[str, Any] = (
-            json.loads(agent_raw) if isinstance(agent_raw, str) else agent_raw
-        )
-
-        discarded = pipeline_state.get("discarded_spend", (0.0, 0))
-        spent_before = discarded[0] + sum(r["cost"] for r in pipeline_state["results"].values())
-        scope = self._new_scope(pipeline_state["run_id"], spent=spent_before)
-        scope.discarded.add(*discarded)
-        with run_scope(scope):
-            return await self._resume(session_id, human_feedback, approved, pipeline_state,
-                                      pause_data, wall_start)
-
-    async def _resume(
-        self,
-        session_id: str,
-        human_feedback: str,
-        approved: bool,
-        pipeline_state: dict[str, Any],
-        pause_data: dict[str, Any],
-        wall_start: float,
-    ) -> PipelineResult:
+    async def _resume(self, decision: _Decision, paused: _PausedRun, wall_start: float) -> PipelineResult:
         assert self._memory is not None  # checked by resume()
-        task: str = pipeline_state["task"]
-        run_id: str = pipeline_state["run_id"]
-        current_level: int = pipeline_state["current_level"]
-        context: dict[str, Any] = pipeline_state["context"]
-        paused_name: str = pipeline_state["paused_agent_name"]
+        session_id = decision.session_id
+        state = paused.state
+        task: str = state["task"]
+        run_id: str = state["run_id"]
+        current_level: int = state["current_level"]
+        context: dict[str, Any] = state["context"]
+        pause_data = paused.pauses[0]
+        paused_name: str = pause_data["agent_name"]
 
         results: dict[str, AgentResult] = {}
-        for name, data in pipeline_state["results"].items():
+        for name, data in state["results"].items():
             results[name] = AgentResult(**data)
         last_output = next(reversed(results.values())).output if results else ""
 
@@ -863,6 +960,7 @@ class Pipeline:
                 "does not support resume_execution"
             )
 
+        prior_output, on_executed = await self._claim_approved_call(decision, paused)
         # Resume the agent with run-scoped state — never mutate the shared
         # instance (concurrent pipeline runs may share it).
         spend = Spend()
@@ -871,13 +969,23 @@ class Pipeline:
                 agent_result = await agent.resume_execution(
                     pause_data,
                     self._llm,
-                    approved,
-                    human_feedback,
+                    decision.approved,
+                    decision.feedback,
                     session_id=session_id,
                     approval_policy=self._approval_policy,
+                    prior_output=prior_output,
+                    on_executed=on_executed,
                 )
-        except PauseExecution:
-            raise
+        except PauseExecution as again:
+            # The same agent needs another approval: the next blocked call of the
+            # batch, or a later call. Its earlier calls are already recorded.
+            paused.pauses[0] = again.as_dict()
+            await self._save_paused(session_id, paused, results, context)
+            return self._build_result(
+                last_output=last_output, results=results, run_id=run_id,
+                levels_executed=current_level, wall_start=wall_start, pause=again,
+                session_id=session_id,
+            )
         except BaseException:
             _discard(spend)
             raise
@@ -886,6 +994,16 @@ class Pipeline:
             agent_result.data if agent_result.data is not None else agent_result.output
         )
         last_output = agent_result.output
+
+        # A sibling paused in the same level is resolved before the level is done (HITL-4).
+        if len(paused.pauses) > 1:
+            paused.pauses = paused.pauses[1:]
+            await self._save_paused(session_id, paused, results, context)
+            return self._build_result(
+                last_output=last_output, results=results, run_id=run_id,
+                levels_executed=current_level, wall_start=wall_start,
+                pause=PauseExecution.from_dict(paused.pauses[0]), session_id=session_id,
+            )
 
         # Continue with remaining pipeline levels (supports nested pauses).
         levels = self._resolve_levels()
@@ -921,9 +1039,7 @@ class Pipeline:
                 session_id=session_id,
             )
 
-        # Clean up HITL keys from memory.
-        await self._memory.delete_key(session_id, "__hitl_pipeline")
-        await self._memory.delete_key(session_id, "__hitl_agent")
+        await self._clear_paused(session_id)
 
         return self._build_result(
             last_output=last_output,

@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from ._scope import run_policy
 from .effects import current_effects, run_tool
 from .exceptions import AgentError, AgentOutputValidationError, EffectUncertainError, ToolError
 from .hitl import ApprovalPolicy, PauseExecution
@@ -29,6 +30,9 @@ MEMORY_SNIPPET_MAX_CHARS = 300
 DEFAULT_OUTPUT_RETRIES = 1
 
 _log = logging.getLogger("agentflow.agent")
+
+
+_HALTED = "[NOT RUN] batch halted after a rejected call"
 
 
 def _guarded(target: Any) -> bool:
@@ -178,7 +182,9 @@ class AgentSpec:
         # Run-scoped state: never mutate the (potentially shared) agent
         # instance for per-run values — concurrent pipelines share it.
         effective_session = session_id if session_id is not None else self._session_id
-        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
+        effective_policy = (
+            approval_policy if approval_policy is not None else self._approval_policy or run_policy()
+        )
         start = time.perf_counter()
         try:
             user_message = await self._prompt_fn(task, context)
@@ -439,13 +445,9 @@ class AgentSpec:
                                 {"role": "tool", "tool_call_id": done_id, "content": doutput}
                             )
 
-                        pending: list[dict[str, Any]] = []
-                        pause_idx = tool_calls.index(call)
-                        for rc in tool_calls[pause_idx:]:
-                            rfn = rc["function"]
-                            rkey = (rfn["name"], rfn["arguments"])
-                            if not (_guarded(tool_map.get(rfn["name"])) and rkey in seen_calls):
-                                pending.append(rc)
+                        # Every remaining call is pending, duplicates included, so
+                        # each gets an answer on resume (HITL-8).
+                        pending = list(tool_calls[tool_calls.index(call):])
                         raise PauseExecution(
                             agent_name=self.name,
                             tool_name=name,
@@ -554,6 +556,8 @@ class AgentSpec:
         *,
         session_id: str | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        prior_output: str | None = None,
+        on_executed: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
         """Resume execution after a :class:`~agentflow.hitl.PauseExecution`.
 
@@ -581,7 +585,9 @@ class AgentSpec:
         # Run-scoped state: never mutate the (potentially shared) agent
         # instance for per-run values — concurrent pipelines share it.
         effective_session = session_id if session_id is not None else self._session_id
-        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
+        effective_policy = (
+            approval_policy if approval_policy is not None else self._approval_policy or run_policy()
+        )
         start = time.perf_counter()
         tool_map = {t.name: t for t in self._tools}
         messages: list[dict[str, Any]] = pause_data["messages"]
@@ -593,61 +599,63 @@ class AgentSpec:
         if effects is not None:
             effects.replay_history(tool_map, pause_data["trace"])
 
+        trace: list[dict[str, Any]] = pause_data["trace"]
+
+        def answer(call_id: str, name: str, args: str, output: str) -> None:
+            trace.append({"tool": name, "arguments": args, "result": output})
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+
         if pending_calls:
             paused_call = pending_calls[0]
-            if approved:
-                call_id, name, args, output = await self._execute_single_tool(
-                    paused_call, tool_map
-                )
-                output = _truncate_output(output)
-                pause_data["trace"].append(
-                    {"tool": name, "arguments": args, "result": output}
-                )
-                messages.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": output}
-                )
+            pfn = paused_call["function"]
+            if not approved:
+                messages.append({"role": "tool", "tool_call_id": paused_call["id"], "content": human_feedback})
+                trace.append({"tool": pfn["name"], "arguments": pfn["arguments"],
+                              "result": f"[HUMAN REJECTED] {human_feedback}"})
+                # A rejection stops the whole batch: the rest was planned around it (HITL-1).
+                for call in pending_calls[1:]:
+                    fn = call["function"]
+                    answer(call["id"], fn["name"], fn["arguments"], _HALTED)
             else:
-                name = paused_call["function"]["name"]
-                args = paused_call["function"]["arguments"]
-                messages.append(
-                    {"role": "tool", "tool_call_id": paused_call["id"], "content": human_feedback}
-                )
-                pause_data["trace"].append(
-                    {
-                        "tool": name,
-                        "arguments": args,
-                        "result": f"[HUMAN REJECTED] {human_feedback}",
-                    }
-                )
-
-            for call in pending_calls[1:]:
-                fn = call["function"]
-                key = (fn["name"], fn["arguments"])
-                guarded = _guarded(tool_map.get(fn["name"]))
-                if guarded and key in seen_calls:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": (
-                                f"Error: Duplicate tool call detected. You already called "
-                                f"'{fn['name']}' with these arguments."
-                            ),
-                        }
-                    )
+                if prior_output is not None:
+                    # Recorded by an earlier resume, or skipped by the operator: never re-run.
+                    output = prior_output
                 else:
+                    _, _, _, output = await self._execute_single_tool(paused_call, tool_map)
+                    if on_executed is not None:
+                        await on_executed(output)
+                answer(paused_call["id"], pfn["name"], pfn["arguments"], _truncate_output(output))
+                for index, call in enumerate(pending_calls[1:], start=1):
+                    fn = call["function"]
+                    key = (fn["name"], fn["arguments"])
+                    guarded = _guarded(tool_map.get(fn["name"]))
+                    if guarded and key in seen_calls:
+                        answer(call["id"], fn["name"], fn["arguments"],
+                               f"Error: Duplicate tool call detected. You already called "
+                               f"'{fn['name']}' with these arguments.")
+                        continue
+                    if effective_policy is not None and effective_policy.requires_approval(
+                        fn["name"], fn["arguments"]
+                    ):
+                        # Approving one call never approves the next (HITL-1).
+                        raise PauseExecution(
+                            agent_name=self.name,
+                            tool_name=fn["name"],
+                            tool_arguments=fn["arguments"],
+                            tool_call_id=call["id"],
+                            messages=messages,
+                            total_tokens=pause_data["total_tokens"],
+                            total_cost=pause_data["total_cost"],
+                            model_name=pause_data["model_name"],
+                            trace=trace,
+                            pending_calls=pending_calls[index:],
+                            seen_calls=[[n, a] for n, a in seen_calls],
+                            iterations_used=pause_data["iterations_used"],
+                        )
                     if guarded:
                         seen_calls.add(key)
-                    cid, tname, targs, output = await self._execute_single_tool(
-                        call, tool_map
-                    )
-                    output = _truncate_output(output)
-                    pause_data["trace"].append(
-                        {"tool": tname, "arguments": targs, "result": output}
-                    )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": cid, "content": output}
-                    )
+                    cid, tname, targs, output = await self._execute_single_tool(call, tool_map)
+                    answer(cid, tname, targs, _truncate_output(output))
 
         content, tokens_used, cost, model_name, final_trace = await self._run_tool_loop(
             messages,
