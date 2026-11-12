@@ -89,6 +89,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `tokens`, `cost` and the tool `trace`.
 - **Trimming keeps whole turns** (LOOP-2: 6 of 30 real requests sent tool results without
   their call). An assistant message and its tool results are dropped together.
+- **`Literal` and other annotations work under `from __future__ import annotations`** (TOOL-1). Tool parameter annotations are resolved with `typing.get_type_hints` in the function's own module; before, a tool in a module with the future import and a `Literal` parameter failed at decoration with a `PydanticUserError`.
 - **Results stay with their call** when two calls share an id (NEW-03), and
   `arguments: null` means no arguments instead of a crash (NEW-04).
 - **Human approval is decided per call.** Rejecting one blocked call used to let the other

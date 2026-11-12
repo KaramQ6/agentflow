@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import typing
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -158,11 +159,17 @@ def tool(
 def _build_args_model(func: Callable[..., Any], tool_name: str) -> Any:
     """Build a Pydantic model describing ``func``'s call signature."""
     sig = inspect.signature(func)
+    # Under ``from __future__ import annotations`` every annotation is a string. Resolve them in
+    # the function's own module, or a Literal or an alias cannot be found (TOOL-1).
+    try:
+        hints = typing.get_type_hints(func, include_extras=True)
+    except Exception:  # noqa: BLE001 - a name only visible inside a function stays unresolved, as before
+        hints = {}
     fields: dict[str, Any] = {}
     for pname, param in sig.parameters.items():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
-        annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
+        annotation = hints.get(pname, param.annotation if param.annotation is not inspect.Parameter.empty else str)
         default = ... if param.default is inspect.Parameter.empty else param.default
         fields[pname] = (annotation, default)
     # Unknown arguments and NaN/Infinity are refused, never dropped or passed on:
