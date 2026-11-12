@@ -13,8 +13,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .exceptions import BudgetExceededError
+
+if TYPE_CHECKING:
+    from .effects import EffectLedger
 
 
 @dataclass
@@ -83,6 +87,7 @@ class RunScope:
     run_id: str
     discarded: Spend = field(default_factory=Spend)
     budget: Budget | None = None
+    effect_ledger: EffectLedger | None = None
 
 
 _scope: ContextVar[RunScope | None] = ContextVar("agentflow_run_scope", default=None)

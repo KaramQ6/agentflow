@@ -24,6 +24,25 @@ class AgentError(AgentFlowError):
         super().__init__(f"Agent '{agent_name}' failed: {message}")
 
 
+class EffectUncertainError(AgentError):
+    """An earlier attempt started a ``write`` tool call and never finished it.
+
+    The library cannot tell whether the effect happened, so it refuses to guess:
+    the pipeline does not retry this error, and the call does not run again.
+    Check the outside world, then resume or re-run on purpose.
+    """
+
+    def __init__(self, agent_name: str, tool_name: str, key: str):
+        self.tool_name = tool_name
+        self.key = key
+        super().__init__(
+            agent_name,
+            f"tool '{tool_name}' was started earlier in this run and never finished; the "
+            f"effect may or may not have happened. Check it before running it again "
+            f"(effect key {key}).",
+        )
+
+
 class AgentTimeoutError(AgentError):
     """Raised when an agent exceeds its configured timeout."""
 

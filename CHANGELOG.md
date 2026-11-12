@@ -46,8 +46,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The sandbox module docstring imported `sandboxed_tool` from `agentflow`, where it is not
   exported (SBX-2). It now imports from `agentflow.sandbox`.
 
+- **A retried agent no longer repeats a side effect.** `@tool(effect="write")` calls go
+  through an effect ledger keyed by run, agent, tool, arguments and occurrence. A retry
+  replays a completed call's result instead of acting again; a repeated command (the same
+  call twice on purpose) still runs (NEW-14). A call that started and never finished raises
+  `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
+  the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **Re-reading a sensor is no longer rejected** for `@tool(effect="read")` (LOOP-1).
+
 ### Added
 
+- `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
+  `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
+  `InMemoryLedger` and `SqliteLedger`.
 - `qos=` and `tls_context=` on `MQTTTrigger` and `MQTTDaemon`; reconnect backoff settings on
   `MQTTTrigger`.
 
@@ -63,6 +74,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
   (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
   `SupervisorAgent`. About 320 lines leave in 0.9.0.
+- **Breaking: an agent that ran a tool without `effect` is not retried** by
+  `retry_failed_agents` (decision 4), because a retry could repeat that tool. The error
+  names the tools. Migration: mark each tool `effect="read"` or `effect="write"`.
+- **Breaking: a `write` tool must be `async`.** A sync function in a thread cannot be
+  cancelled and kept acting after a timeout (NEW-07). Opt-in, so no existing tool breaks.
 - **Breaking: an unpriced model with `budget_usd` set raises `PipelineError`** before the
   first call (COST-4). A budget that cannot be measured is not a budget. Migration for local
   models: `register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`. Without a budget

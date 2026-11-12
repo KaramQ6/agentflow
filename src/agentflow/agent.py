@@ -13,7 +13,8 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from .exceptions import AgentError, AgentOutputValidationError, ToolError
+from .effects import current_effects, run_tool
+from .exceptions import AgentError, AgentOutputValidationError, EffectUncertainError, ToolError
 from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM
 from .memory import BaseMemory
@@ -28,6 +29,12 @@ MEMORY_SNIPPET_MAX_CHARS = 300
 DEFAULT_OUTPUT_RETRIES = 1
 
 _log = logging.getLogger("agentflow.agent")
+
+
+def _guarded(target: Any) -> bool:
+    """Whether the duplicate-call guard applies. Classified tools opt out (ADR 0006):
+    re-reading is normal, and repeating a command is a new effect."""
+    return target is None or target.effect is None
 
 
 def _truncate_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str:
@@ -392,14 +399,16 @@ class AgentSpec:
             results_map: dict[str, tuple[str, str, str, str]] = {}
             coros: list[tuple[str, asyncio.Task[tuple[str, str, str, str]]]] = []
             call_order: list[str] = []
+            last_write: asyncio.Task[tuple[str, str, str, str]] | None = None
 
             for call in tool_calls:
                 fn = call["function"]
                 name = fn["name"]
                 arguments = fn["arguments"]
                 key = (name, arguments)
+                guarded = _guarded(tool_map.get(name))
 
-                if key in seen_calls:
+                if guarded and key in seen_calls:
                     dup_msg = (
                         f"Error: Duplicate tool call detected. You already called "
                         f"'{name}' with these arguments. Try a different approach."
@@ -435,7 +444,7 @@ class AgentSpec:
                         for rc in tool_calls[pause_idx:]:
                             rfn = rc["function"]
                             rkey = (rfn["name"], rfn["arguments"])
-                            if rkey not in seen_calls:
+                            if not (_guarded(tool_map.get(rfn["name"])) and rkey in seen_calls):
                                 pending.append(rc)
                         raise PauseExecution(
                             agent_name=self.name,
@@ -451,10 +460,17 @@ class AgentSpec:
                             seen_calls=[[n, a] for n, a in seen_calls],
                             iterations_used=iteration,
                         )
-                    seen_calls.add(key)
-                    coros.append(
-                        (call["id"], asyncio.create_task(self._execute_single_tool(call, tool_map)))
-                    )
+                    if guarded:
+                        seen_calls.add(key)
+                    target = tool_map.get(name)
+                    if target is not None and target.effect == "write":
+                        # Side effects run one at a time, in the model's order (NEW-12).
+                        last_write = asyncio.create_task(self._after(last_write, call, tool_map))
+                        coros.append((call["id"], last_write))
+                    else:
+                        coros.append(
+                            (call["id"], asyncio.create_task(self._execute_single_tool(call, tool_map)))
+                        )
                 call_order.append(call["id"])
 
             # Await all unique tool calls (they were dispatched concurrently).
@@ -482,6 +498,17 @@ class AgentSpec:
             f"exceeded max_tool_iterations={self._max_tool_iterations} without a final answer",
         )
 
+    async def _after(
+        self,
+        previous: asyncio.Task[tuple[str, str, str, str]] | None,
+        call: dict[str, Any],
+        tool_map: dict[str, Any],
+    ) -> tuple[str, str, str, str]:
+        """Run *call* once the previous write call in the batch has finished."""
+        if previous is not None:
+            await previous  # its failure propagates, so later writes never run after it
+        return await self._execute_single_tool(call, tool_map)
+
     async def _execute_single_tool(
         self, call: dict[str, Any], tool_map: dict[str, Any]
     ) -> tuple[str, str, str, str]:
@@ -500,11 +527,13 @@ class AgentSpec:
         else:
             _log.info("Tool executing in agent %s: %s(%s)", self.name, name, arguments[:120])
             try:
-                output = await target.acall(arguments)
+                output = await run_tool(target, arguments, current_effects())
                 _log.info(
                     "Tool completed in agent %s: %s (output %d chars)",
                     self.name, name, len(output),
                 )
+            except EffectUncertainError:
+                raise  # the model cannot resolve this; stop the agent and ask a human
             except ToolError as e:
                 output = f"Error: {e}"
                 _log.error("Tool error in agent %s: %s — %s", self.name, name, e)
@@ -560,6 +589,9 @@ class AgentSpec:
         seen_calls: set[tuple[str, str]] = set(
             tuple(p) for p in pause_data.get("seen_calls", [])
         )
+        effects = current_effects()
+        if effects is not None:
+            effects.replay_history(tool_map, pause_data["trace"])
 
         if pending_calls:
             paused_call = pending_calls[0]
@@ -591,7 +623,8 @@ class AgentSpec:
             for call in pending_calls[1:]:
                 fn = call["function"]
                 key = (fn["name"], fn["arguments"])
-                if key in seen_calls:
+                guarded = _guarded(tool_map.get(fn["name"]))
+                if guarded and key in seen_calls:
                     messages.append(
                         {
                             "role": "tool",
@@ -603,7 +636,8 @@ class AgentSpec:
                         }
                     )
                 else:
-                    seen_calls.add(key)
+                    if guarded:
+                        seen_calls.add(key)
                     cid, tname, targs, output = await self._execute_single_tool(
                         call, tool_map
                     )

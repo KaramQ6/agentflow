@@ -14,8 +14,15 @@ from typing import TYPE_CHECKING, Any
 
 from ._scope import Budget, RunScope, Spend, current_scope, new_run_id, run_scope, tracking
 from .agent import AgentLike, AgentSpec
+from .effects import EffectLedger, EffectScope, InMemoryLedger, using_effects
 from .events import EventEmitter
-from .exceptions import AgentError, AgentTimeoutError, BudgetExceededError, PipelineError
+from .exceptions import (
+    AgentError,
+    AgentTimeoutError,
+    BudgetExceededError,
+    EffectUncertainError,
+    PipelineError,
+)
 from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM, unpriced_budget_error
 from .memory import BaseMemory
@@ -181,6 +188,11 @@ class Pipeline:
         budget_usd: Optional hard cost ceiling for a single run. Each LLM call
             reserves its worst case first; a call that cannot fit raises
             BudgetExceededError. The model must have a price (see ADR 0005).
+        effect_ledger: Where ``@tool(effect="write")`` calls are recorded so a
+            retry or ``resume()`` never repeats one. Default: a new in-memory
+            ledger per run, which covers retries in this process. Pass a durable
+            one (``agentflow.effects.SqliteLedger``) to cover ``resume()`` in a new
+            process. See ADR 0004.
         max_concurrency: Maximum agents in flight at once, across the whole
             run. Without it a level of 40 agents opens 40 concurrent LLM
             calls. ``None`` (default) means the level width is the only limit.
@@ -203,12 +215,15 @@ class Pipeline:
         approval_policy: ApprovalPolicy | None = None,
         budget_usd: float | None = None,
         max_concurrency: int | None = None,
+        effect_ledger: EffectLedger | None = None,
     ):
         if max_concurrency is not None and max_concurrency < 1:
             raise PipelineError(
                 f"max_concurrency must be at least 1, got {max_concurrency}"
             )
         self._max_concurrency = max_concurrency
+        self._effect_ledger = effect_ledger
+        self._warned_volatile_effects = False
         self._llm = llm
         self._retry_failed_agents = retry_failed_agents
         self._hooks = hooks
@@ -355,14 +370,40 @@ class Pipeline:
         return "\n".join(lines)
 
     def _new_scope(self, run_id: str, spent: float = 0.0) -> RunScope:
-        """A run scope with this pipeline's budget. Refuses a budget that cannot be measured."""
+        """A run scope with this pipeline's budget and effect ledger.
+
+        Refuses a budget that cannot be measured.
+        """
+        self._warn_if_effects_are_volatile()
+        ledger = self._effect_ledger if self._effect_ledger is not None else InMemoryLedger()
         if self._budget_usd is None:
-            return RunScope(run_id)
+            return RunScope(run_id, effect_ledger=ledger)
         # A duck-typed LLM without a model id is checked per call instead, where it bills.
         model = getattr(self._llm, "model", None)
         if model and not is_priced(model):
             raise unpriced_budget_error(model)
-        return RunScope(run_id, budget=Budget(self._budget_usd, spent))
+        return RunScope(run_id, budget=Budget(self._budget_usd, spent), effect_ledger=ledger)
+
+    def _warn_if_effects_are_volatile(self) -> None:
+        """A paused run can resume in another process; an in-memory ledger cannot follow it."""
+        if self._warned_volatile_effects or self._memory is None or self._effect_ledger is not None:
+            return
+        writes = [t.name for n in self._nodes for t in getattr(n.agent, "_tools", []) if t.effect == "write"]
+        if writes:
+            self._warned_volatile_effects = True
+            _logger.warning(
+                "Pipeline has a memory backend and write tools %s but no durable effect_ledger. "
+                "A resume() in a new process cannot tell which writes already ran. Pass "
+                "effect_ledger=agentflow.effects.SqliteLedger(path).",
+                writes,
+            )
+
+    def _effects_for(self, agent_name: str) -> EffectScope | None:
+        """A fresh effect scope for one attempt (one conversation) of *agent_name*."""
+        scope = current_scope()
+        if scope is None or scope.effect_ledger is None:
+            return None
+        return EffectScope(scope.effect_ledger, scope.run_id, agent_name)
 
     async def _execute_node(
         self,
@@ -378,22 +419,31 @@ class Pipeline:
 
         for attempt in range(attempts):
             spend = Spend()
+            effects = self._effects_for(agent.name)
             try:
-                with tracking(spend):
+                with tracking(spend), using_effects(effects):
                     result = await self._attempt(node, task, context, session_id)
                 result.level = level_index
                 return result
 
             except PauseExecution:
                 raise  # its spend travels in the pause state, on the resumed result
-            except AgentTimeoutError:
+            except (AgentTimeoutError, EffectUncertainError):
                 _discard(spend)
-                raise  # timeouts are not retriable
+                raise  # not retriable: a timeout repeats, an uncertain effect needs a human
             except AgentError as exc:
                 _discard(spend)
                 stop = _budget_stop()
                 if stop is not None:
                     raise stop from exc  # retrying cannot make a full budget fit
+                if attempts > 1 and effects is not None and effects.ran_unclassified:
+                    tools = sorted(effects.ran_unclassified)
+                    raise AgentError(
+                        agent.name,
+                        f"not retried: it ran {tools}, which declare no effect, so a retry could "
+                        "repeat them. Mark each tool effect=\"read\" (safe to repeat) or "
+                        "effect=\"write\" (recorded, never repeated) to allow retries.",
+                    ) from exc
                 if attempt < attempts - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -817,7 +867,7 @@ class Pipeline:
         # instance (concurrent pipeline runs may share it).
         spend = Spend()
         try:
-            with tracking(spend):
+            with tracking(spend), using_effects(self._effects_for(paused_name)):
                 agent_result = await agent.resume_execution(
                     pause_data,
                     self._llm,

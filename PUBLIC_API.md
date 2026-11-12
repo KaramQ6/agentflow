@@ -18,7 +18,7 @@ in `agentflow.__all__`:
 | Memory | `BaseMemory`, `InMemoryContext`, `RedisContext`, `VectorContext` |
 | Ops | `RateLimiter`, `ResponseCache`, `InMemoryCache`, `RedisCache` |
 | Observability | `Hooks`, `LoggingHooks`, `PipelineLogger`, `get_logger` |
-| Exceptions | `AgentFlowError`, `AgentError`, `AgentTimeoutError`, `AgentOutputValidationError`, `BudgetExceededError`, `PipelineError`, `LLMError`, `ToolError` |
+| Exceptions | `AgentFlowError`, `AgentError`, `AgentTimeoutError`, `AgentOutputValidationError`, `BudgetExceededError`, `EffectUncertainError`, `PipelineError`, `LLMError`, `ToolError` |
 | HITL | `ApprovalPolicy`, `PauseExecution` |
 
 Covered semantics (not just names):
@@ -46,6 +46,9 @@ Covered semantics (not just names):
   (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
   only when `budget_usd` is set, because a budget must be measurable
   (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- `tool(effect=...)`: `"read"` tools may repeat and run concurrently; `"write"` tools run
+  one at a time in the model's order and at most once per occurrence in a run; an agent
+  that ran a tool without `effect` is not retried. See ADR 0006. *Added in 0.8.0.*
 - `budget_usd` is enforced by reserving each LLM call's worst-case cost before it
   is sent, and its total includes discarded attempts. *Changed in 0.8.0.*
 - `LLM.generate(**extra)` forwards unknown keywords to the provider unchanged,
@@ -69,6 +72,7 @@ Importable by full path, excluded from the stability contract:
   `MQTTDaemon`)
 - `agentflow.swarm_routing` — `DynamicSupervisorAgent`. **Deprecated in 0.8.0,
   removed in 0.9.0** (see below)
+- `agentflow.effects` — effect ledgers (`InMemoryLedger`, `SqliteLedger`)
 - `agentflow.contrib.*` — third-party bridges (e.g. `contrib.otel.OTelHooks`)
 
 ## Current deprecations

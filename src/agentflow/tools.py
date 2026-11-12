@@ -21,11 +21,13 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import create_model
 
 from .exceptions import ToolError
+
+Effect = Literal["read", "write"]
 
 
 class Tool:
@@ -38,6 +40,13 @@ class Tool:
         name: Tool name exposed to the model (defaults to the function name).
         description: Human/LLM-readable description (defaults to the docstring).
         parameters: JSON schema for the arguments, in OpenAI function format.
+        effect: What calling the tool does to the world (ADR 0006).
+            ``"read"`` only observes: it may be repeated, retried and run
+            concurrently. ``"write"`` changes something: it runs at most once per
+            occurrence in a run (the effect ledger) and one at a time, in the
+            model's order, and must be async so it can be cancelled. ``None``
+            (default) keeps 0.7 behaviour, but an agent that ran such a tool is
+            not retried, because a retry could repeat it.
     """
 
     def __init__(
@@ -45,11 +54,21 @@ class Tool:
         func: Callable[..., Any],
         name: str | None = None,
         description: str | None = None,
+        *,
+        effect: Effect | None = None,
     ):
+        if effect not in (None, "read", "write"):
+            raise ValueError(f"effect must be 'read', 'write' or None, got {effect!r}")
         self.func = func
         self.name = name or func.__name__
         self.description = description or inspect.getdoc(func) or ""
+        self.effect = effect
         self._is_async = asyncio.iscoroutinefunction(func)
+        if effect == "write" and not self._is_async:
+            raise TypeError(
+                f"tool {self.name!r}: a write tool must be async. A sync function runs in a "
+                "thread that cannot be cancelled, so it would keep acting after a timeout."
+            )
         self._model = _build_args_model(func, self.name)
         self.parameters = _clean_schema(self._model.model_json_schema())
 
@@ -78,6 +97,10 @@ class Tool:
         Raises:
             ToolError: If the arguments are malformed or the function raises.
         """
+        return await self._invoke(self._validate(arguments))
+
+    def _validate(self, arguments: dict[str, Any] | str) -> dict[str, Any]:
+        """Parse and validate *arguments*; return the coerced kwargs. Never calls the function."""
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments) if arguments.strip() else {}
@@ -90,9 +113,11 @@ class Tool:
             validated = self._model(**arguments)
         except Exception as e:  # pydantic ValidationError or TypeError
             raise ToolError(self.name, f"argument validation failed: {e}") from e
+        return {k: getattr(validated, k) for k in type(validated).model_fields}
 
+    async def _invoke(self, kwargs: dict[str, Any]) -> str:
+        """Call the function with already-validated kwargs."""
         try:
-            kwargs = {k: getattr(validated, k) for k in type(validated).model_fields}
             if self._is_async:
                 result = await self.func(**kwargs)
             else:
@@ -111,14 +136,17 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    effect: Effect | None = None,
 ) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Decorator that turns a function into a :class:`Tool`.
 
     Usable bare (``@tool``) or with arguments (``@tool(name="lookup")``).
+    Declare what the tool does with ``effect="read"`` or ``effect="write"``
+    (see :class:`Tool`).
     """
 
     def wrap(fn: Callable[..., Any]) -> Tool:
-        return Tool(fn, name=name, description=description)
+        return Tool(fn, name=name, description=description, effect=effect)
 
     return wrap(func) if func is not None else wrap
 
