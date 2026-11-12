@@ -60,6 +60,9 @@ Covered semantics (not just names):
   reply's tool calls; an approved call runs at most once across `resume()` calls, and
   `resume(on_in_doubt=...)` decides what happens to one that never recorded a result.
   *Changed in 0.8.0.*
+- A dependent of a skipped agent still runs, and the skipped agent's output is simply absent from its
+  context: read it with `context.get(name)`. Optional fan-in needs this, so it is the contract and
+  not a bug (PIPE-2). *Documented in 0.8.0.*
 - `tool(effect=...)`: `"read"` tools may repeat and run concurrently; `"write"` tools run
   one at a time in the model's order and at most once per occurrence in a run; an agent
   that ran a tool without `effect` is not retried. See ADR 0006. *Added in 0.8.0.*

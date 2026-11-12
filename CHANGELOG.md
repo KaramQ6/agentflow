@@ -113,6 +113,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   is refused with a `[BLOCKED]` observation, since a worker cannot pause the pipeline.
 - **Re-reading a sensor is no longer rejected** for `@tool(effect="read")` (LOOP-1).
 
+### Documented
+
+- A dependent of a skipped agent still runs without that agent's output in its context (PIPE-2). Optional fan-in depends on it, so it is now stated in `PUBLIC_API.md` instead of being left implicit.
+
 ### Added
 
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
