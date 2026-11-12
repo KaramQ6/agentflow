@@ -158,6 +158,18 @@ class _Decision:
     on_in_doubt: InDoubt
 
 
+def _without_repeated_payload(task_prompt: str, context_data: dict[str, Any]) -> dict[str, Any]:
+    """Context to append to the prompt, minus a payload the prompt already carries.
+
+    A trigger puts the raw payload in the prompt and again, raw and parsed, in its context;
+    sending all three costs three times the tokens (MQTT-3).
+    """
+    raw = context_data.get("payload_raw")
+    if isinstance(raw, str) and raw in task_prompt:
+        return {k: v for k, v in context_data.items() if k not in ("payload_raw", "payload")}
+    return context_data
+
+
 def _discarded_state() -> tuple[float, int]:
     scope = current_scope()
     return (scope.discarded.cost, scope.discarded.tokens) if scope is not None else (0.0, 0)
@@ -418,14 +430,20 @@ class Pipeline:
         """
         self._warn_if_effects_are_volatile()
         ledger = self._effect_ledger if self._effect_ledger is not None else InMemoryLedger()
+        hooks = self._hooks
+        on_tool_error = (
+            (lambda agent, tool, error: safe_invoke(hooks, "on_tool_error", agent, tool, error))
+            if hooks is not None else None
+        )
         if self._budget_usd is None:
-            return RunScope(run_id, effect_ledger=ledger, policy=self._approval_policy)
+            return RunScope(run_id, effect_ledger=ledger, policy=self._approval_policy,
+                            on_tool_error=on_tool_error)
         # A duck-typed LLM without a model id is checked per call instead, where it bills.
         model = getattr(self._llm, "model", None)
         if model and not is_priced(model):
             raise unpriced_budget_error(model)
         return RunScope(run_id, budget=Budget(self._budget_usd, spent), effect_ledger=ledger,
-                        policy=self._approval_policy)
+                        policy=self._approval_policy, on_tool_error=on_tool_error)
 
     def _warn_if_effects_are_volatile(self) -> None:
         """A paused run can resume in another process; an in-memory ledger cannot follow it."""
@@ -553,6 +571,7 @@ class Pipeline:
                 "session_id": session_id,
                 "current_level": level_index,
                 "discarded_spend": _discarded_state(),
+                "tool_errors": list(scope.tool_errors) if (scope := current_scope()) is not None else [],
             }
             await self._save_paused(
                 session_id,
@@ -645,7 +664,9 @@ class Pipeline:
     ) -> PipelineResult:
         """Build the final PipelineResult (``paused`` when *pause* is given)."""
         total_tokens, total_cost = _run_totals(results)
+        scope = current_scope()
         return PipelineResult(
+            tool_errors=list(scope.tool_errors) if scope is not None else [],
             unpriced_models=_unpriced_models_used(results),
             output=last_output,
             results=results,
@@ -752,15 +773,28 @@ class Pipeline:
 
             first_error: tuple[_PipelineNode, BaseException] | None = None
             pauses: list[PauseExecution] = []
+            self_cancelled: list[_PipelineNode] = []
             for node, result in zip(to_run, level_results, strict=False):
                 if isinstance(result, PauseExecution):
                     pauses.append(result)
                 elif isinstance(result, asyncio.CancelledError):
                     # Cancelled by the fail-fast above; the agent that actually
                     # failed is another entry in this same list.
+                    self_cancelled.append(node)
                     continue
                 elif isinstance(result, BaseException) and first_error is None:
                     first_error = (node, result)
+
+            if first_error is None and self_cancelled and not pauses:
+                # Nothing failed, yet an agent ended cancelled: it cancelled itself (PIPE-1).
+                first_error = (
+                    self_cancelled[0],
+                    AgentError(
+                        self_cancelled[0].agent.name,
+                        "was cancelled from inside: a CancelledError escaped the agent "
+                        "(a library it calls cancelled its own task?)",
+                    ),
+                )
 
             if first_error is not None:
                 node, error = first_error
@@ -845,16 +879,19 @@ class Pipeline:
                 session_id=session_id,
                 run_id=run_id,
             )
-        except BudgetExceededError as exc:
-            # The completed levels have already been paid for; hand them back
-            # rather than making the ceiling destroy what it was protecting.
-            exc.partial_result = self._build_result(
-                last_output=_last_output_of(results),
-                results=results,
-                run_id=run_id,
-                levels_executed=_levels_completed(results),
-                wall_start=wall_start,
-            )
+        except BaseException as exc:
+            if isinstance(exc, BudgetExceededError):
+                # The completed levels have already been paid for; hand them back
+                # rather than making the ceiling destroy what it was protecting.
+                exc.partial_result = self._build_result(
+                    last_output=_last_output_of(results),
+                    results=results,
+                    run_id=run_id,
+                    levels_executed=_levels_completed(results),
+                    wall_start=wall_start,
+                )
+            if self._hooks is not None:
+                safe_invoke(self._hooks, "on_pipeline_error", exc, run_id)  # closes the span (HOOK-2)
             raise
 
         pipeline_result = self._build_result(
@@ -924,6 +961,7 @@ class Pipeline:
             spent_before = discarded[0] + sum(r["cost"] for r in state["results"].values())
             scope = self._new_scope(state["run_id"], spent=spent_before)
             scope.discarded.add(*discarded)
+            scope.tool_errors.extend(state.get("tool_errors", []))
             with run_scope(scope):
                 return await self._resume(
                     _Decision(session_id, human_feedback, approved, on_in_doubt), paused, wall_start
@@ -1071,8 +1109,10 @@ class Pipeline:
 
         async def _run_scoped(run_id: str) -> None:
             session_id = self._session_id or run_id
+            if self._hooks is not None:
+                safe_invoke(self._hooks, "on_pipeline_start", task, run_id, len(self._nodes))
             try:
-                _, pause, _ = await self._run_levels(
+                last_output, pause, levels_executed = await self._run_levels(
                     levels=levels,
                     start_level=0,
                     task=task,
@@ -1093,6 +1133,11 @@ class Pipeline:
                     )
                     return
 
+                if self._hooks is not None:
+                    safe_invoke(self._hooks, "on_pipeline_end", self._build_result(
+                        last_output=last_output, results=results, run_id=run_id,
+                        levels_executed=levels_executed, wall_start=wall_start,
+                    ))
                 total_tokens, total_cost = _run_totals(results)
                 emitter.emit(
                     "pipeline_complete",
@@ -1104,8 +1149,13 @@ class Pipeline:
                     levels_executed=len(levels),
                     unpriced_models=_unpriced_models_used(results),
                 )
-            except Exception as e:
-                emitter.emit("pipeline_error", error=str(e))
+            except BaseException as e:
+                if self._hooks is not None:
+                    safe_invoke(self._hooks, "on_pipeline_error", e, run_id)
+                if isinstance(e, Exception):
+                    emitter.emit("pipeline_error", error=str(e))
+                else:
+                    raise  # a cancel is not swallowed; the finally still ends the stream
             finally:
                 emitter.done()
 
@@ -1128,34 +1178,43 @@ class Pipeline:
         max_concurrent: int = 5,
         on_result: Callable[[PipelineResult], Any] | None = None,
         on_error: Callable[[Exception, str], Any] | None = None,
+        *,
+        max_pending: int | None = 100,
+        overflow: Literal["wait", "drop_oldest"] = "wait",
+        max_age_s: float | None = None,
     ) -> None:
         """Run the pipeline as a daemon consuming a continuous trigger stream.
 
         Continuously consumes ``(task_prompt, context_data)`` tuples from
-        *trigger* and dispatches independent :meth:`run` invocations in the
-        background via ``asyncio.create_task``.  The method runs forever
-        until the trigger stream is exhausted or a ``CancelledError`` is
-        received.
+        *trigger* and runs each through :meth:`run`, at most *max_concurrent* at
+        a time. The method runs until the trigger stream is exhausted or a
+        ``CancelledError`` is received.
 
-        A semaphore-based backpressure mechanism caps the number of
-        concurrently executing pipeline runs to *max_concurrent*, preventing
-        a spike of incoming messages from overwhelming the host.
+        Readings wait in a queue of at most *max_pending*. By default a full
+        queue makes the trigger wait, so no data is lost and the backlog cannot
+        grow without bound. For telemetry, where a late reading is worth less
+        than a fresh one, ``overflow="drop_oldest"`` discards the oldest waiting
+        reading instead, and *max_age_s* discards any reading that has waited
+        longer than that before a run could start. Each discard is logged.
 
-        When a trigger yields a non-empty ``context_data`` dict, it is
-        appended to the task prompt as a JSON block so the payload reaches
-        the agents.
+        When a trigger yields a non-empty ``context_data`` dict, it is appended
+        to the task prompt as a JSON block so the payload reaches the agents. A
+        payload already present in the prompt is not repeated there.
 
         Args:
             trigger: A :class:`~agentflow.triggers.BaseTrigger` that yields
                      ``(task_prompt, context_data)`` tuples.
-            max_concurrent: Maximum number of pipeline runs allowed to execute
-                            in parallel (default 5).
+            max_concurrent: Maximum number of pipeline runs in parallel (default 5).
             on_result: Optional async/sync callback invoked with each
                        completed :class:`PipelineResult`.
             on_error: Optional async/sync callback invoked with
                       ``(exception, task_prompt)`` when a single pipeline
                       run fails.  If not provided errors are logged and
                       swallowed so the daemon keeps running.
+            max_pending: Most readings allowed to wait for a free run
+                         (default 100). ``None`` means unbounded.
+            overflow: ``"wait"`` (default) or ``"drop_oldest"``.
+            max_age_s: Drop a reading that waited longer than this many seconds.
 
         Example::
 
@@ -1164,47 +1223,83 @@ class Pipeline:
             await pipe.serve(
                 MQTTTrigger(broker="localhost", topic="sensors/#"),
                 max_concurrent=3,
+                overflow="drop_oldest",
+                max_age_s=30,
                 on_result=lambda r: print(f"Done: {r.run_id}"),
             )
         """
-        sem = asyncio.Semaphore(max_concurrent)
+        if max_concurrent < 1:
+            raise PipelineError(f"max_concurrent must be at least 1, got {max_concurrent}")
+        if max_pending is not None and max_pending < 1:
+            raise PipelineError(f"max_pending must be at least 1 or None, got {max_pending}")
+        if overflow not in ("wait", "drop_oldest"):
+            raise PipelineError(f"overflow must be 'wait' or 'drop_oldest', got {overflow!r}")
 
         async def _run_one(task_prompt: str, context_data: dict[str, Any]) -> None:
             # Trigger payloads travel with the task — otherwise they'd be lost.
-            if context_data:
-                task_prompt = (
-                    f"{task_prompt}\n\nContext data (JSON):\n{json.dumps(context_data)}"
-                )
-            async with sem:
+            extra = _without_repeated_payload(task_prompt, context_data)
+            if extra:
+                task_prompt = f"{task_prompt}\n\nContext data (JSON):\n{json.dumps(extra)}"
+            try:
+                result = await self.run(task_prompt)
+                if on_result is not None:
+                    maybe_coro = on_result(result)
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+            except Exception as exc:
+                if on_error is not None:
+                    maybe_coro = on_error(exc, task_prompt)
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                else:
+                    _logger.error(
+                        "Pipeline daemon run failed for prompt %r: %s",
+                        task_prompt[:200],
+                        exc,
+                    )
+
+        queue: asyncio.Queue[tuple[float, str, dict[str, Any]] | None] = asyncio.Queue(max_pending or 0)
+
+        async def _worker() -> None:
+            while True:
+                item = await queue.get()
                 try:
-                    result = await self.run(task_prompt)
-                    if on_result is not None:
-                        maybe_coro = on_result(result)
-                        if asyncio.iscoroutine(maybe_coro):
-                            await maybe_coro
-                except Exception as exc:
-                    if on_error is not None:
-                        maybe_coro = on_error(exc, task_prompt)
-                        if asyncio.iscoroutine(maybe_coro):
-                            await maybe_coro
-                    else:
-                        _logger.error(
-                            "Pipeline daemon run failed for prompt %r: %s",
-                            task_prompt[:200],
-                            exc,
+                    if item is None:
+                        return
+                    queued_at, task_prompt, context_data = item
+                    waited = time.monotonic() - queued_at
+                    if max_age_s is not None and waited > max_age_s:
+                        _logger.warning(
+                            "serve() dropped a reading that waited %.1fs (max_age_s=%s): %r",
+                            waited, max_age_s, task_prompt[:100],
                         )
+                        continue
+                    await _run_one(task_prompt, context_data)
+                finally:
+                    queue.task_done()
 
-        tasks: set[asyncio.Task[None]] = set()
-
+        workers = [asyncio.create_task(_worker()) for _ in range(max_concurrent)]
         try:
             async for task_prompt, context_data in trigger.listen():
-                task = asyncio.create_task(_run_one(task_prompt, context_data))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+                if overflow == "drop_oldest" and queue.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        dropped = queue.get_nowait()
+                        queue.task_done()
+                        if dropped is not None:
+                            _logger.warning(
+                                "serve() dropped the oldest waiting reading (max_pending=%s): %r",
+                                max_pending, dropped[1][:100],
+                            )
+                await queue.put((time.monotonic(), task_prompt, context_data))
+            for _ in workers:  # the stream ended: let every waiting reading finish
+                await queue.put(None)
+            await asyncio.gather(*workers)
         except asyncio.CancelledError:
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            # Runs already started are allowed to finish; readings still waiting are not started.
+            while not queue.empty():
+                queue.get_nowait()
+                queue.task_done()
+            for _ in workers:
+                queue.put_nowait(None)
+            await asyncio.gather(*workers, return_exceptions=True)
             raise
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)

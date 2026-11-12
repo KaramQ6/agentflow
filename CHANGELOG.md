@@ -52,6 +52,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   call twice on purpose) still runs (NEW-14). A call that started and never finished raises
   `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
   the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **A failed run closes its span, and `stream()` fires the pipeline hooks** (HOOK-1, HOOK-2).
+  New `Hooks.on_pipeline_error(error, run_id)` fires for a failed, budget-stopped or cancelled
+  run; `OTelHooks` ends the root span with status ERROR. `OTelHooks` also keeps its spans per
+  run, so one hooks object shared by concurrent runs (`serve()`) no longer mixes them.
+- **Tool failures are visible on the result** (NEW-11, NEW-13). `PipelineResult.tool_errors`
+  lists every tool call that failed, was refused for invalid arguments, or named a tool the
+  agent does not have, and `Hooks.on_tool_error(agent, tool, error)` fires for each. `status`
+  is unchanged. On real ROS 2 a lost link during `move` left the run `completed` with the
+  stop command lost (B6); the failure is now on the result.
+- **An agent that cancels itself raises `AgentError` naming it**, not a bare
+  `AssertionError` (PIPE-1).
+- **`Pipeline.serve()` has a bounded queue** (SERVE-1): `max_pending` (default 100), and a
+  full queue makes the trigger wait so nothing is lost. `overflow="drop_oldest"` and
+  `max_age_s` are for telemetry. Before, every reading became a task at once: 1,993 waiting
+  with `max_concurrent=2`, and the oldest reading was 15 s stale when the model saw it.
+- **A payload is sent to the model once** (MQTT-3). `serve()` no longer appends the raw and
+  parsed payload to a prompt that already contains it.
 - **One retry layer.** The OpenAI SDK retried on its own and the agent loop retried again on
   top of `LLM.max_retries`: a bad API key made 18 HTTP calls and a 500 made 9 where 3 were
   promised (LLM-1). The SDK's retries are off, the agent adds none, and `LLM` retries only
@@ -100,6 +117,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
   `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
   `InMemoryLedger` and `SqliteLedger`.
+- `Hooks.on_pipeline_error`, `Hooks.on_tool_error`, `PipelineResult.tool_errors`,
+  `Pipeline.serve(max_pending=, overflow=, max_age_s=)`.
 - `agentflow.testing` (opt-in): `ScriptedLLM`, `reply()` and `call()` run a pipeline against
   a script at zero cost. It replaces only the provider round trip (`LLM._complete`, the new
   replacement seam), so caching, budget reservation and accounting run as in production.

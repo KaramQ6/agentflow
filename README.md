@@ -507,6 +507,14 @@ lost broker connection reconnects with backoff, and `qos=` and `tls_context=` ar
 passed to the broker. `MQTTTrigger` reconnects the same way, so `Pipeline.serve()`
 keeps running through a broker restart.
 
+`Pipeline.serve()` queues readings (`max_pending`, default 100) and a full queue makes the
+trigger wait, so nothing is lost. For telemetry, where a late reading is worth less than a
+fresh one, drop the oldest instead and discard anything that waited too long:
+
+```python
+await pipe.serve(trigger, max_concurrent=2, overflow="drop_oldest", max_age_s=30)
+```
+
 ### Performance & Cost Expectations
 
 - **Trigger Overhead**: `< 2ms` for Pydantic policy validation and message ingestion.

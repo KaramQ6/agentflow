@@ -46,6 +46,10 @@ Covered semantics (not just names):
   (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
   only when `budget_usd` is set, because a budget must be measurable
   (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- `Hooks.on_pipeline_error` and `Hooks.on_tool_error` (no-op defaults) and
+  `PipelineResult.tool_errors` report failures that `status` does not. A started run
+  ends with `on_pipeline_end` or `on_pipeline_error`; `stream()` fires the same hooks as
+  `run()`. *Added in 0.8.0.*
 - `LLM.generate` is the one retry layer, for transient errors only. `AgentResult.metadata`
   carries `finish_reason`, and `truncated` when a reply was cut off; an empty cut-off reply
   raises. *Changed in 0.8.0.*

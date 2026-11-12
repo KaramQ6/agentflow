@@ -37,6 +37,27 @@ class OTelHooks(Hooks):
 pipe = Pipeline(llm=llm, hooks=OTelHooks())
 ```
 
+## Failures
+
+Every run that starts ends with exactly one of `on_pipeline_end` or `on_pipeline_error`
+(a run that pauses for approval ends with neither). `on_pipeline_error(error, run_id)` also
+fires for a budget stop and for a cancellation, so a trace span never stays open.
+`stream()` fires the same pipeline hooks as `run()`.
+
+A tool that fails, is refused for invalid arguments, or is asked for under a name the agent
+does not have calls `on_tool_error(agent, tool, error)`, and is listed on the result:
+
+```python
+result = await pipe.run(task)
+for failure in result.tool_errors:
+    # {"agent": "pilot", "tool": "move", "effect": "write", "kind": "failed", "error": "..."}
+    print(failure)
+```
+
+`kind` is `"failed"`, `"invalid_arguments"` or `"unknown_tool"`. `result.status` stays
+`"completed"` because the model usually recovers, so this list is how you learn that a
+`write` tool may have left the world in an unknown state.
+
 ## Streaming events
 
 For live progress in the same process, use `pipeline.stream()` instead — it yields

@@ -13,13 +13,13 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from ._scope import run_policy
+from ._scope import report_tool_error, run_policy
 from .effects import current_effects, run_tool
 from .exceptions import AgentError, AgentOutputValidationError, EffectUncertainError, ToolError
 from .hitl import ApprovalPolicy, PauseExecution
 from .llm import LLM, _estimate_prompt_tokens
 from .memory import BaseMemory
-from .tools import Tool
+from .tools import InvalidArguments, Tool
 from .types import AgentResult
 
 DEFAULT_MAX_TOOL_ITERATIONS = 6
@@ -615,6 +615,7 @@ class AgentSpec:
         if target is None:
             output = f"Error: unknown tool '{name}'"
             _log.error("Unknown tool called in agent %s: %s", self.name, name)
+            report_tool_error(self.name, name, None, "unknown_tool", ToolError(name, "no such tool"))
         else:
             _log.info("Tool executing in agent %s: %s(%s)", self.name, name, arguments[:120])
             try:
@@ -628,11 +629,14 @@ class AgentSpec:
             except ToolError as e:
                 output = f"Error: {e}"
                 _log.error("Tool error in agent %s: %s — %s", self.name, name, e)
+                kind = "invalid_arguments" if isinstance(e, InvalidArguments) else "failed"
+                report_tool_error(self.name, name, target.effect, kind, e)
             except Exception as e:
                 output = f"Error: unexpected exception - {str(e)}"
                 _log.error(
                     "Unexpected exception in agent %s tool %s: %s", self.name, name, e,
                 )
+                report_tool_error(self.name, name, target.effect, "failed", e)
 
         return call["id"], name, arguments, output
 

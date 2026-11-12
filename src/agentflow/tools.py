@@ -30,6 +30,10 @@ from .exceptions import ToolError
 Effect = Literal["read", "write"]
 
 
+class InvalidArguments(ToolError):
+    """The arguments never reached the function: bad JSON, an unknown or missing field."""
+
+
 class Tool:
     """An LLM-callable wrapper around a Python function.
 
@@ -105,14 +109,14 @@ class Tool:
             try:
                 arguments = json.loads(arguments) if arguments.strip() else {}
             except json.JSONDecodeError as e:
-                raise ToolError(self.name, f"invalid JSON arguments: {e}") from e
+                raise InvalidArguments(self.name, f"invalid JSON arguments: {e}") from e
         if not isinstance(arguments, dict):
-            raise ToolError(self.name, "arguments must be a JSON object")
+            raise InvalidArguments(self.name, "arguments must be a JSON object")
 
         try:
             validated = self._model(**arguments)
         except Exception as e:  # pydantic ValidationError or TypeError
-            raise ToolError(self.name, f"argument validation failed: {e}") from e
+            raise InvalidArguments(self.name, f"argument validation failed: {e}") from e
         return {k: getattr(validated, k) for k in type(validated).model_fields}
 
     async def _invoke(self, kwargs: dict[str, Any]) -> str:

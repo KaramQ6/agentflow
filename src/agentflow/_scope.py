@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .exceptions import BudgetExceededError
 
@@ -90,10 +90,24 @@ class RunScope:
     budget: Budget | None = None
     effect_ledger: EffectLedger | None = None
     policy: ApprovalPolicy | None = None  # reaches supervisor workers too (HITL-9)
+    tool_errors: list[dict[str, Any]] = field(default_factory=list)
+    on_tool_error: Callable[[str, str, Exception], None] | None = None
 
 
 _scope: ContextVar[RunScope | None] = ContextVar("agentflow_run_scope", default=None)
 _trackers: ContextVar[tuple[Spend, ...]] = ContextVar("agentflow_spend_trackers", default=())
+
+
+def report_tool_error(agent: str, tool: str, effect: str | None, kind: str, error: Exception) -> None:
+    """Record a failed tool call on the run (``PipelineResult.tool_errors``) and tell the hooks."""
+    scope = _scope.get()
+    if scope is None:
+        return
+    scope.tool_errors.append(
+        {"agent": agent, "tool": tool, "effect": effect, "kind": kind, "error": str(error)}
+    )
+    if scope.on_tool_error is not None:
+        scope.on_tool_error(agent, tool, error)
 
 
 def new_run_id() -> str:
