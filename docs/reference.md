@@ -118,4 +118,6 @@ change or disappear in any release.
 
 ::: agentflow.triggers.run_mqtt
 
+Deprecated in 0.8.0 and removed in 0.9.0. Use `SupervisorAgent`.
+
 ::: agentflow.swarm_routing.DynamicSupervisorAgent

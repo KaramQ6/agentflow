@@ -31,3 +31,6 @@ nova_bridge/
 run_nova_bridge.py
 # Multi-agent orchestration workspace — untracked local state, never a package file
 .bridgespace/
+
+# mkdocs build output
+site/

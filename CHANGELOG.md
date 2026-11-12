@@ -58,6 +58,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   handlers run at once (default 5); an alarm that arrives while full is skipped and retried on
   the next message. 500 messages of the same low-battery state used to start 500 pipelines.
   Restore the old behaviour with `cooldown_s=0, max_concurrent=None`.
+- **`agentflow.swarm_routing` is deprecated** and will be removed in 0.9.0 (decision 8).
+  Importing it emits a `DeprecationWarning`. Its three distinguishing features do not work:
+  the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
+  (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
+  `SupervisorAgent`. About 320 lines leave in 0.9.0.
 - **Breaking: an unpriced model with `budget_usd` set raises `PipelineError`** before the
   first call (COST-4). A budget that cannot be measured is not a budget. Migration for local
   models: `register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`. Without a budget

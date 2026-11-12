@@ -67,9 +67,8 @@ Importable by full path, excluded from the stability contract:
 - `agentflow.triggers` — event-driven triggers and the MQTT daemon
   (`BaseTrigger`, `MQTTTrigger`, `TriggerPolicy`, `PydanticTriggerPolicy`,
   `MQTTDaemon`)
-- `agentflow.swarm_routing` — `DynamicSupervisorAgent`, a supervisor with
-  Pydantic-generated delegation schemas, strict worker context isolation and
-  depth-capped delegation
+- `agentflow.swarm_routing` — `DynamicSupervisorAgent`. **Deprecated in 0.8.0,
+  removed in 0.9.0** (see below)
 - `agentflow.contrib.*` — third-party bridges (e.g. `contrib.otel.OTelHooks`)
 
 ## Current deprecations
@@ -85,6 +84,7 @@ Deprecated names emit `DeprecationWarning` as of 0.6.
 | `set_session` / `set_approval_policy` on agents | `execute(..., session_id=, approval_policy=)` — mutating shared instances is unsafe under concurrency | 1.0 |
 | The `_DecoratorAgent` name | `AgentSpec` (same class; renamed in 0.6) | 1.0 |
 | Top-level imports of sandbox/trigger names | Full-path imports (`agentflow.sandbox`, `agentflow.triggers`) | done in 0.6 |
+| `agentflow.swarm_routing` (`DynamicSupervisorAgent`) | `SupervisorAgent`. Its depth cap never fired (`depth=0` is hard-coded), it crashed on structured context, and it shared cost across runs. Importing it warns as of 0.8.0 | 0.9.0 |
 
 ## Deprecation policy
 

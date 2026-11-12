@@ -6,7 +6,7 @@ opt-in submodules and are NOT re-exported here:
 
 - ``agentflow.sandbox``   — Docker/subprocess code-execution sandboxes
 - ``agentflow.triggers``  — event-driven daemon triggers (MQTT)
-- ``agentflow.swarm_routing`` — depth-capped delegating supervisor
+- ``agentflow.swarm_routing`` — deprecated in 0.8.0, removed in 0.9.0
 
 See PUBLIC_API.md for the stability contract.
 """
