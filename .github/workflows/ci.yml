@@ -65,10 +65,30 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  # The main matrix resolves the newest dependencies. This job pins the lowest
+  # versions pyproject.toml allows, so a lower bound that stops working fails here
+  # instead of on a user's machine. No coverage gate: otel is not installed.
+  test-lowest:
+    name: Tests (lowest dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install the lowest supported versions
+        run: pip install -e ".[dev]" "openai==1.55.3" "pydantic==2.0"
+
+      - name: Run tests
+        run: pytest tests/ -q
+
   build:
     name: Build Distribution
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, test-lowest]
     steps:
       - uses: actions/checkout@v4
 

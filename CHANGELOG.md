@@ -9,6 +9,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dependency bounds.** `openai>=1.0.0` allowed versions that cannot start: openai below 1.55.3
+  passes `proxies` to httpx, which httpx 0.28 removed, so `LLM()` raised on construction. The bound
+  is now `openai>=1.55.3,<4` and `pydantic>=2.0.0,<3`. openai 3.x replaced httpx with httpx2;
+  agentflow does not import either, and the newest release tested is openai 3.50.0.
+- **CI tests the lowest versions.** A new `test-lowest` job runs the suite on Python 3.10 with
+  `openai==1.55.3` and `pydantic==2.0`, next to the matrix that resolves the newest.
+
 ---
 
 ## [0.8.0] - 2026-11-13
