@@ -23,14 +23,13 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agentflow import LLM, Agent, LoggingHooks, Pipeline
-from agentflow.triggers import MQTTTrigger
+from agentflow.triggers import MQTTTrigger, run_mqtt
 from agentflow.types import PipelineResult
 
 # ─── Agents ──────────────────────────────────────────────────────────────────────
@@ -118,4 +117,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_mqtt(main())  # asyncio.run on a loop aiomqtt supports, on Windows too

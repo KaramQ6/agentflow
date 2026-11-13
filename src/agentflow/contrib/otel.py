@@ -31,6 +31,7 @@ except ImportError as _exc:  # pragma: no cover - import guard
         "pip install opentelemetry-api opentelemetry-sdk"
     ) from _exc
 
+from .._scope import current_scope
 from ..observability import Hooks
 
 if TYPE_CHECKING:
@@ -48,11 +49,17 @@ class OTelHooks(Hooks):
 
     def __init__(self, tracer: Any = None):
         self._tracer = tracer or trace.get_tracer("agentflow")
-        self._pipeline_span: Any = None
-        self._agent_spans: dict[str, Any] = {}
+        # Keyed by run: one hooks object serves concurrent runs (serve()).
+        self._pipeline_spans: dict[str, Any] = {}
+        self._agent_spans: dict[tuple[str, str], Any] = {}
+
+    @staticmethod
+    def _run_id() -> str:
+        scope = current_scope()
+        return scope.run_id if scope is not None else ""
 
     def on_pipeline_start(self, task: str, run_id: str, agent_count: int) -> None:
-        self._pipeline_span = self._tracer.start_span(
+        self._pipeline_spans[run_id] = self._tracer.start_span(
             "pipeline.run",
             attributes={
                 "agentflow.run_id": run_id,
@@ -62,19 +69,17 @@ class OTelHooks(Hooks):
         )
 
     def on_agent_start(self, agent: str, level: int) -> None:
-        parent_ctx = (
-            trace.set_span_in_context(self._pipeline_span)
-            if self._pipeline_span is not None
-            else None
-        )
-        self._agent_spans[agent] = self._tracer.start_span(
+        run_id = self._run_id()
+        pipeline_span = self._pipeline_spans.get(run_id)
+        parent_ctx = trace.set_span_in_context(pipeline_span) if pipeline_span is not None else None
+        self._agent_spans[(run_id, agent)] = self._tracer.start_span(
             f"agent.{agent}",
             context=parent_ctx,
             attributes={"agentflow.agent": agent, "agentflow.level": level},
         )
 
     def on_agent_end(self, result: AgentResult) -> None:
-        span = self._agent_spans.pop(result.agent, None)
+        span = self._agent_spans.pop((self._run_id(), result.agent), None)
         if span is None:
             return
         span.set_attribute("agentflow.tokens", result.tokens_used)
@@ -84,7 +89,7 @@ class OTelHooks(Hooks):
         span.end()
 
     def on_agent_error(self, agent: str, error: Exception) -> None:
-        span = self._agent_spans.pop(agent, None)
+        span = self._agent_spans.pop((self._run_id(), agent), None)
         if span is None:
             return
         span.record_exception(error)
@@ -92,11 +97,20 @@ class OTelHooks(Hooks):
         span.end()
 
     def on_pipeline_end(self, result: PipelineResult) -> None:
-        if self._pipeline_span is None:
+        span = self._pipeline_spans.pop(result.run_id, None)
+        if span is None:
             return
-        self._pipeline_span.set_attribute("agentflow.total_tokens", result.total_tokens)
-        self._pipeline_span.set_attribute("agentflow.total_cost_usd", result.total_cost)
-        self._pipeline_span.set_attribute("agentflow.wall_time_s", result.wall_time)
-        self._pipeline_span.set_attribute("agentflow.status", result.status)
-        self._pipeline_span.end()
-        self._pipeline_span = None
+        span.set_attribute("agentflow.total_tokens", result.total_tokens)
+        span.set_attribute("agentflow.total_cost_usd", result.total_cost)
+        span.set_attribute("agentflow.wall_time_s", result.wall_time)
+        span.set_attribute("agentflow.status", result.status)
+        span.set_attribute("agentflow.tool_errors", len(result.tool_errors))
+        span.end()
+
+    def on_pipeline_error(self, error: BaseException, run_id: str) -> None:
+        span = self._pipeline_spans.pop(run_id, None)
+        if span is None:
+            return
+        span.record_exception(error)
+        span.set_status(Status(StatusCode.ERROR, str(error) or type(error).__name__))
+        span.end()

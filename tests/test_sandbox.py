@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -184,10 +183,12 @@ class TestSubprocessSandbox:
 class TestDockerSandbox:
     @pytest.mark.asyncio
     async def test_unsupported_language(self):
+        # The language check needs no daemon: entering the context would connect to one.
         sandbox = DockerSandbox(auto_pull=False)
-        async with sandbox:
-            with pytest.raises(SandboxError, match="Unsupported language"):
-                await sandbox.execute_code("ruby", "puts 'hi'")
+        sandbox._client = mock.MagicMock()
+        with pytest.raises(SandboxError, match="Unsupported language"):
+            await sandbox.execute_code("ruby", "puts 'hi'")
+        sandbox._client.containers.run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_execute_python_mocked(self):
@@ -232,11 +233,15 @@ class TestDockerSandbox:
 
     @pytest.mark.asyncio
     async def test_timeout_kills_container(self):
+        import threading
+
         mock_client = mock.MagicMock()
         mock_container = mock.MagicMock()
+        release = threading.Event()
 
-        async def slow_wait():
-            await asyncio.sleep(60)
+        def slow_wait():
+            # The Docker SDK is synchronous; the sandbox calls it in a worker thread.
+            release.wait(60)
             return {"StatusCode": 0}
 
         mock_container.wait.side_effect = slow_wait
@@ -245,8 +250,11 @@ class TestDockerSandbox:
         sandbox = DockerSandbox(auto_pull=False)
         sandbox._client = mock_client
 
-        with pytest.raises(SandboxTimeoutError, match="timed out"):
-            await sandbox.execute_code("python", "while True: pass", timeout=1)
+        try:
+            with pytest.raises(SandboxTimeoutError, match="timed out"):
+                await sandbox.execute_code("python", "while True: pass", timeout=1)
+        finally:
+            release.set()
 
         mock_container.kill.assert_called_once()
         mock_container.remove.assert_called_once_with(force=True)

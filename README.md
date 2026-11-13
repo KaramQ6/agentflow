@@ -53,7 +53,7 @@ Works against any OpenAI-compatible API — 100% local and free with Ollama, or 
 
 ```python
 from pydantic import BaseModel, Field
-from agentflow import LLM, Pipeline
+from agentflow import LLM, Pipeline, register_price
 from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy
 
 class DroneTelemetry(BaseModel):
@@ -72,6 +72,7 @@ policy = PydanticTriggerPolicy(
 
 # Point to local Ollama (free/offline) or cloud (Groq/OpenAI):
 llm = LLM(model="llama3.2", base_url="http://localhost:11434/v1", api_key="ollama")
+register_price("llama3.2", 0, 0)                 # local model: free, so the budget can measure it
 
 pipe = Pipeline(llm=llm, budget_usd=0.01)       # hard cost ceiling per telemetry event
 pipe.add(threat_assessor, timeout=30)           # Level 0: classifies severity (CRITICAL / WARNING)
@@ -112,7 +113,7 @@ You don't need an MQTT broker or hardware setup to test agentflow. Run a local s
 
 ```python
 import asyncio
-from agentflow import Agent, Pipeline, LLM
+from agentflow import Agent, Pipeline, LLM, register_price
 
 # Run local & free with Ollama, or use Groq / OpenAI:
 llm = LLM(
@@ -129,6 +130,9 @@ async def monitor(task: str, context: dict) -> str:
 async def failsafe(task: str, context: dict) -> str:
     analysis = context["sensor_monitor"]
     return f"Based on telemetry analysis: '{analysis}', specify safety action or NOMINAL."
+
+# A budget needs a price for the model. Local models are free:
+register_price("llama3.2", 0, 0)
 
 # Build DAG: failsafe runs after monitor completes
 pipe = Pipeline(llm=llm, budget_usd=0.01)
@@ -163,6 +167,13 @@ llm = LLM(
     api_key="ollama",  # dummy key, required by OpenAI client
 )
 ```
+
+Declare the context the server was started with, so agents trim to fit instead of
+the server cutting requests silently: `LLM(..., context_window=8192)` (Ollama's
+`num_ctx`; it defaults to 4096 on GPUs under 24 GiB).
+
+A budget needs a price for every model, so a local model is declared free:
+`register_price("llama3.2", 0, 0)`. Without `budget_usd` no price is needed.
 
 - **Zero API bills**: All inference stays on your local hardware.
 - **Zero telemetry**: No prompts or payloads leave your machine.
@@ -268,8 +279,9 @@ register_price("my-finetuned-model", prompt_per_1m=0.50, completion_per_1m=1.50)
 
 ### Cost Budgets
 
-Put a hard ceiling on a run. The budget is checked after each DAG level, and
-the error hands back the work you already paid for instead of discarding it:
+Put a hard ceiling on a run. Every LLM call reserves its worst-case cost before
+it is sent, so parallel agents and tool loops cannot run past the ceiling. The
+error hands back the work you already paid for instead of discarding it:
 
 ```python
 from agentflow import BudgetExceededError
@@ -463,7 +475,7 @@ Run pipelines as continuous edge services listening to sensor topics (requires `
 
 ```python
 from pydantic import BaseModel
-from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy
+from agentflow.triggers import MQTTDaemon, PydanticTriggerPolicy, run_mqtt
 
 class MachineTelemetry(BaseModel):
     rpm: float
@@ -483,9 +495,24 @@ daemon = MQTTDaemon(
     topic="factory/machines/+/telemetry",
     policy=policy,
     handler=handle_telemetry_incident,  # runs asynchronously without blocking MQTT listener
+    cooldown_s=30,      # a sustained alarm fires once, then at most every 30 s
+    max_concurrent=5,   # at most 5 handlers (pipeline runs) in flight
 )
 
-await daemon.serve()
+run_mqtt(daemon.serve())   # like asyncio.run, but on a loop aiomqtt supports on Windows
+```
+
+A message that is not a JSON object is skipped without dropping the connection, a
+lost broker connection reconnects with backoff, and `qos=` and `tls_context=` are
+passed to the broker. `MQTTTrigger` reconnects the same way, so `Pipeline.serve()`
+keeps running through a broker restart.
+
+`Pipeline.serve()` queues readings (`max_pending`, default 100) and a full queue makes the
+trigger wait, so nothing is lost. For telemetry, where a late reading is worth less than a
+fresh one, drop the oldest instead and discard anything that waited too long:
+
+```python
+await pipe.serve(trigger, max_concurrent=2, overflow="drop_oldest", max_age_s=30)
 ```
 
 ### Performance & Cost Expectations

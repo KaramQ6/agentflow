@@ -134,8 +134,8 @@ async def test_a_failing_agent_marks_its_span_as_errored(exporter):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_run_does_not_leave_a_dangling_pipeline_span(exporter):
-    """A run that raises never calls on_pipeline_end; the span must not appear."""
+async def test_a_failed_run_closes_its_pipeline_span_with_an_error(exporter):
+    """A run that raises still ends its root span, marked ERROR (HOOK-2)."""
     memory, tracer = exporter
     pipe = Pipeline(llm=MockLLM(), hooks=OTelHooks(tracer=tracer))
     pipe.add(ExplodingAgent("boom"))
@@ -143,7 +143,31 @@ async def test_a_failed_run_does_not_leave_a_dangling_pipeline_span(exporter):
     with pytest.raises(AgentError):
         await pipe.run("task")
 
-    assert "pipeline.run" not in _by_name(memory)
+    span = _by_name(memory)["pipeline.run"]
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert span.events, "the exception should be recorded on the root span"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_get_their_own_spans(exporter):
+    """One OTelHooks serves every run of a pipeline (serve()); spans must not mix."""
+    import asyncio
+
+    memory, tracer = exporter
+    class SlowAgent(SimpleAgent):
+        async def execute(self, task, context, llm):
+            await asyncio.sleep(0.02)  # both runs are open at once
+            return await super().execute(task, context, llm)
+
+    pipe = Pipeline(llm=MockLLM(), hooks=OTelHooks(tracer=tracer))
+    pipe.add(SlowAgent("slow"))
+
+    await asyncio.gather(pipe.run("a"), pipe.run("b"))
+
+    roots = [s for s in memory.get_finished_spans() if s.name == "pipeline.run"]
+    assert len(roots) == 2, "each run closes exactly its own root span"
+    ids = {s.attributes["agentflow.run_id"] for s in roots}
+    assert len(ids) == 2
 
 
 def test_hooks_default_to_the_global_tracer():

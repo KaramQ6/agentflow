@@ -38,6 +38,15 @@ class Hooks:
     def on_pipeline_end(self, result: PipelineResult) -> None:
         """Called once after the pipeline finishes successfully."""
 
+    def on_pipeline_error(self, error: BaseException, run_id: str) -> None:
+        """Called once when a run that started ends with an error, including a budget
+        stop or a cancellation. A started run always gets exactly one of
+        ``on_pipeline_end``, ``on_pipeline_error`` or (when it pauses) neither."""
+
+    def on_tool_error(self, agent: str, tool: str, error: Exception) -> None:
+        """Called when a tool call fails, is refused for invalid arguments, or names a
+        tool the agent does not have. The model sees the failure; this tells you."""
+
 
 class LoggingHooks(Hooks):
     """Hooks that emit structured JSON logs via :class:`PipelineLogger`.
@@ -74,6 +83,20 @@ class LoggingHooks(Hooks):
         if self._log is not None:
             self._log.log_pipeline_complete(
                 result.run_id, result.total_tokens, result.total_duration
+            )
+
+    def on_pipeline_error(self, error: BaseException, run_id: str) -> None:
+        if self._log is not None:
+            self._log.error(
+                "Pipeline failed",
+                extra={"event": "pipeline_error", "run_id": run_id, "error": str(error) or type(error).__name__},
+            )
+
+    def on_tool_error(self, agent: str, tool: str, error: Exception) -> None:
+        if self._log is not None:
+            self._log.warning(
+                f"Tool failed: {tool}",
+                extra={"event": "tool_error", "agent": agent, "tool": tool, "error": str(error)},
             )
 
 

@@ -25,16 +25,11 @@ class FakeTopic:
         self.value = value
 
 
-class FakeQoS:
-    def __init__(self, value: int = 0):
-        self.value = value
-
-
 class FakeMessage:
     def __init__(self, payload: bytes, topic: str = "test/topic", qos: int = 0):
         self.payload = payload
         self.topic = FakeTopic(topic)
-        self.qos = FakeQoS(qos)
+        self.qos = qos  # aiomqtt 2.x: a plain int, not an enum (the old fake hid MQTT-4)
 
 
 class FakeClient:
@@ -45,6 +40,7 @@ class FakeClient:
         self._on_exhausted = on_exhausted
         self._fail_with = fail_with
         self.subscribed_to = None
+        self.subscribed_qos = None
 
     async def __aenter__(self):
         if self._fail_with is not None:
@@ -54,8 +50,9 @@ class FakeClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def subscribe(self, topic):
+    async def subscribe(self, topic, qos=0):
         self.subscribed_to = topic
+        self.subscribed_qos = qos
 
     @property
     def messages(self):
@@ -92,6 +89,12 @@ def fake_mqtt(monkeypatch):
 # ── MQTTTrigger ───────────────────────────────────────────────────────────────
 
 
+async def _take(trigger, n: int = 1) -> list:
+    """The first *n* items. listen() reconnects forever, so it is never exhausted."""
+    stream = trigger.listen()
+    return [await asyncio.wait_for(stream.__anext__(), timeout=2) for _ in range(n)]
+
+
 @pytest.mark.asyncio
 async def test_trigger_yields_prompt_and_parsed_payload(fake_mqtt):
     fake_mqtt(
@@ -99,9 +102,8 @@ async def test_trigger_yields_prompt_and_parsed_payload(fake_mqtt):
     )
     trigger = MQTTTrigger(broker="localhost", topic="factory/#", prompt_template="Data: {data}")
 
-    received = [item async for item in trigger.listen()]
+    received = await _take(trigger)
 
-    assert len(received) == 1
     prompt, ctx = received[0]
     assert prompt == 'Data: {"temp": 82}'
     assert ctx["payload"] == {"temp": 82}
@@ -111,11 +113,11 @@ async def test_trigger_yields_prompt_and_parsed_payload(fake_mqtt):
 
 @pytest.mark.asyncio
 async def test_trigger_subscribes_to_the_configured_topic(fake_mqtt):
-    client = FakeClient([])
+    client = FakeClient([FakeMessage(b"{}")])
     fake_mqtt(lambda _: client)
     trigger = MQTTTrigger(broker="localhost", topic="sensors/+/temp")
 
-    [item async for item in trigger.listen()]
+    await _take(trigger)
 
     assert client.subscribed_to == "sensors/+/temp"
 
@@ -125,7 +127,7 @@ async def test_trigger_passes_non_json_payloads_through_as_text(fake_mqtt):
     fake_mqtt(lambda _: FakeClient([FakeMessage(b"not json at all")]))
     trigger = MQTTTrigger(broker="localhost")
 
-    (_, ctx), = [item async for item in trigger.listen()]
+    (_, ctx), = await _take(trigger)
 
     assert ctx["payload"] == "not json at all"
     assert ctx["payload_raw"] == "not json at all"
@@ -136,7 +138,7 @@ async def test_trigger_survives_undecodable_bytes(fake_mqtt):
     fake_mqtt(lambda _: FakeClient([FakeMessage(b"\xff\xfe bad bytes")]))
     trigger = MQTTTrigger(broker="localhost")
 
-    received = [item async for item in trigger.listen()]
+    received = await _take(trigger)
 
     assert len(received) == 1, "a bad byte sequence must not kill the listener"
 
@@ -147,7 +149,7 @@ async def test_trigger_without_aiomqtt_explains_the_extra(monkeypatch):
     trigger = MQTTTrigger(broker="localhost")
 
     with pytest.raises(ImportError, match=r"agentflowkit\[mqtt\]"):
-        [item async for item in trigger.listen()]
+        await _take(trigger)
 
 
 # ── TriggerPolicy ─────────────────────────────────────────────────────────────

@@ -68,3 +68,6 @@ nav:
       - Fail-fast DAG levels: adr/0001-fail-fast-dag-levels.md
       - Structured output: adr/0002-structured-output-via-prompt-and-repair.md
       - Unpriced models: adr/0003-unpriced-models-report-zero-loudly.md
+      - Effect ledger: adr/0004-effect-ledger-for-side-effecting-tools.md
+      - Hard budget by reservation: adr/0005-hard-budget-by-reservation.md
+      - Tool effects: adr/0006-tool-effects.md

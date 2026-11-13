@@ -93,6 +93,8 @@ here. The opt-in modules at the bottom are explicitly *not* covered by semver.
 
 ::: agentflow.BudgetExceededError
 
+::: agentflow.EffectUncertainError
+
 ::: agentflow.PipelineError
 
 ::: agentflow.LLMError
@@ -106,6 +108,12 @@ change or disappear in any release.
 
 ::: agentflow.contrib.otel.OTelHooks
 
+::: agentflow.testing.ScriptedLLM
+
+::: agentflow.effects.InMemoryLedger
+
+::: agentflow.effects.SqliteLedger
+
 ::: agentflow.triggers.BaseTrigger
 
 ::: agentflow.triggers.MQTTTrigger
@@ -115,5 +123,9 @@ change or disappear in any release.
 ::: agentflow.triggers.PydanticTriggerPolicy
 
 ::: agentflow.triggers.MQTTDaemon
+
+::: agentflow.triggers.run_mqtt
+
+Deprecated in 0.8.0 and removed in 0.9.0. Use `SupervisorAgent`.
 
 ::: agentflow.swarm_routing.DynamicSupervisorAgent

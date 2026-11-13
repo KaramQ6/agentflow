@@ -1,13 +1,17 @@
 """Tests for DynamicSupervisorAgent swarm routing."""
 
 import json
+import warnings
 
 import pytest
 
 from agentflow import Agent, AgentResult, BaseAgent, LLMResponse
 from agentflow.exceptions import AgentError
 from agentflow.llm import LLM
-from agentflow.swarm_routing import MAX_DELEGATION_DEPTH, DynamicSupervisorAgent
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)  # deprecated in 0.8.0, tested until removal
+    from agentflow.swarm_routing import MAX_DELEGATION_DEPTH, DynamicSupervisorAgent
 
 # --------------------------------------------------------------------------- #
 # Helpers

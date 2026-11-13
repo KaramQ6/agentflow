@@ -4,6 +4,12 @@ The :class:`DynamicSupervisorAgent` builds on :class:`SupervisorAgent` by
 dynamically generating the ``delegate_task`` tool schema using Pydantic's
 ``create_model``, enforcing strict context isolation for workers, and
 capping delegation recursion depth to prevent infinite worker-to-worker loops.
+
+.. deprecated:: 0.8.0
+   Removed in 0.9.0. Use :class:`agentflow.SupervisorAgent`. The three features
+   that set this module apart do not work: the depth cap is always fed ``depth=0``,
+   structured upstream context crashes it, and its cost state is shared across
+   concurrent runs.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import warnings
 from typing import Any
 
 from .agent import DEFAULT_MAX_TOOL_ITERATIONS, MESSAGES_MAX_LENGTH, BaseAgent, _truncate_output
@@ -20,6 +27,14 @@ from .tools import Tool
 from .types import AgentResult
 
 _log = logging.getLogger("agentflow.swarm_routing")
+
+warnings.warn(
+    "agentflow.swarm_routing is deprecated and will be removed in 0.9.0. Use "
+    "agentflow.SupervisorAgent: the depth cap of DynamicSupervisorAgent never "
+    "fires (it is always fed depth=0) and its cost state is shared across runs.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 MAX_DELEGATION_DEPTH = 3
 

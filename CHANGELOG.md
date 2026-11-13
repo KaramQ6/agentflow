@@ -11,6 +11,195 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.8.0] - 2026-11-13
+
+Correctness release. 0.7.1 passed its own tests while defects that only show against real
+services reproduced: a real MQTT broker, a real Docker daemon, real ROS 2 and a real local model.
+Each is fixed or documented below, with a regression test.
+
+**Upgrading from 0.7.x.** These change behaviour. Each has a migration:
+
+1. **A budget needs a priced model.** `budget_usd` with an unpriced model raises `PipelineError`
+   before the first call. Local models: `register_price("llama3.2", 0, 0)`.
+2. **Tool arguments are strict.** Unknown arguments and NaN or Infinity are refused with an error the
+   model can correct. Declare every argument a tool accepts.
+3. **`retry_failed_agents` skips agents that ran a tool without `effect`**, because a retry could repeat
+   it. Mark tools `effect="read"` or `effect="write"`.
+4. **`LLM(timeout=120)`** instead of the SDK's 600 s. Very slow models: `LLM(timeout=600)`.
+5. **Paused runs from 0.7.x cannot be resumed.** Pause state moved. Resume or drop them before upgrading.
+6. **`MQTTDaemon` debounces** (`cooldown_s=30`, `max_concurrent=5`). Old behaviour:
+   `cooldown_s=0, max_concurrent=None`.
+7. **`agentflow.swarm_routing` is deprecated**, removed in 0.9.0. Use `SupervisorAgent`.
+8. **An `LLM` subclass that overrides `generate`** bypasses retries, pricing and the budget. Override
+   `_complete` instead.
+9. **`run_id` is 32 hex characters**, was 8.
+10. **A write tool must be `async`** (opt-in, so no existing tool breaks).
+
+Also changed, without a migration: a rejected tool call stops the rest of its reply, approving one call
+no longer approves the next, a reply cut off by `max_tokens` with no content raises, and the iteration cap
+makes one more call without tools.
+
+### Fixed
+- **A run's total now includes every billed call.** An attempt that failed and was retried,
+  timed out, or was cancelled by a failing sibling used to vanish from
+  `PipelineResult.total_cost` and `total_tokens`, and from the budget check (COST-1). The
+  spend of such attempts is now counted, including across a HITL pause and `resume()`.
+  `AgentResult.cost` is unchanged: it still covers only the result it belongs to.
+- **`budget_usd` is a real ceiling.** It used to be checked once per DAG level, so a
+  level of parallel agents overshot it tenfold and a tool loop never checked it at all
+  (COST-2, COST-3). Every LLM call now reserves its worst-case cost before it is sent and
+  settles after. A refusal is final for the run and is not retried. See ADR 0005.
+- **MQTT works against a real broker.** `MQTTTrigger` and `MQTTDaemon` crashed on the first
+  real message: aiomqtt 2.x gives `qos` as an int, and the test fake gave an object (MQTT-4).
+  Tests now also run against a real broker (`amqtt`) with the real client.
+- **One malformed MQTT message no longer kills the daemon.** A payload such as `42` made
+  `MQTTDaemon` tear down and rebuild its connection in a loop (2,599 reconnects, no message
+  handled). Non-object JSON and policy errors are now logged and skipped per message (MQTT-1).
+- **`MQTTTrigger` reconnects** with backoff instead of ending its stream, so
+  `Pipeline.serve()` survives a broker restart (SERVE-2).
+- **Windows: a clear error instead of a silent reconnect loop.** aiomqtt cannot run on the
+  default Proactor loop. The daemon and the trigger now fail at once with a message, and
+  `agentflow.triggers.run_mqtt(main())` runs a program on a loop that works.
+- **Sandbox: code written by a model could read the host's secrets.** `SubprocessSandbox`
+  passed the whole host environment, API keys included, to the code it ran. It now passes
+  only `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `TMPDIR` and `LANG`.
+- **Sandbox: C++ in Docker never worked.** The default image `gcc:14-alpine` does not exist
+  (SBX-1), and Docker mounts `/tmp` noexec by default, so a compiled binary could not run
+  even with a valid image. The image is now `gcc:14` and `/tmp` is an exec tmpfs.
+- **Sandbox containers run as `nobody` with a 64-process cap** (fork bombs stop there).
+  Verified against a real Docker daemon: uid 65534, `pids.max` 64, no network, no host
+  variables.
+- The sandbox module docstring imported `sandboxed_tool` from `agentflow`, where it is not
+  exported (SBX-2). It now imports from `agentflow.sandbox`.
+- **A retried agent no longer repeats a side effect.** `@tool(effect="write")` calls go
+  through an effect ledger keyed by run, agent, tool, arguments and occurrence. A retry
+  replays a completed call's result instead of acting again; a repeated command (the same
+  call twice on purpose) still runs (NEW-14). A call that started and never finished raises
+  `EffectUncertainError` and is not retried. Write calls in one reply run one at a time, in
+  the model's order (NEW-12). See ADR 0004 (amended) and ADR 0006.
+- **A failed run closes its span, and `stream()` fires the pipeline hooks** (HOOK-1, HOOK-2).
+  New `Hooks.on_pipeline_error(error, run_id)` fires for a failed, budget-stopped or cancelled
+  run; `OTelHooks` ends the root span with status ERROR. `OTelHooks` also keeps its spans per
+  run, so one hooks object shared by concurrent runs (`serve()`) no longer mixes them.
+- **Tool failures are visible on the result** (NEW-11, NEW-13). `PipelineResult.tool_errors`
+  lists every tool call that failed, was refused for invalid arguments, or named a tool the
+  agent does not have, and `Hooks.on_tool_error(agent, tool, error)` fires for each. `status`
+  is unchanged. On real ROS 2 a lost link during `move` left the run `completed` with the
+  stop command lost (B6); the failure is now on the result.
+- **An agent that cancels itself raises `AgentError` naming it**, not a bare
+  `AssertionError` (PIPE-1).
+- **`Pipeline.serve()` has a bounded queue** (SERVE-1): `max_pending` (default 100), and a
+  full queue makes the trigger wait so nothing is lost. `overflow="drop_oldest"` and
+  `max_age_s` are for telemetry. Before, every reading became a task at once: 1,993 waiting
+  with `max_concurrent=2`, and the oldest reading was 15 s stale when the model saw it.
+- **A payload is sent to the model once** (MQTT-3). `serve()` no longer appends the raw and
+  parsed payload to a prompt that already contains it.
+- **One retry layer.** The OpenAI SDK retried on its own and the agent loop retried again on
+  top of `LLM.max_retries`: a bad API key made 18 HTTP calls and a 500 made 9 where 3 were
+  promised (LLM-1). The SDK's retries are off, the agent adds none, and `LLM` retries only
+  what can succeed: connection errors, timeouts, 429 and 5xx.
+- **A reply cut off by `max_tokens` is visible** (NEW-02). An empty one raises `AgentError`;
+  a partial one sets `metadata["truncated"]`. `metadata["finish_reason"]` is always recorded.
+  On a real thinking model, a 64-token budget produced no answer at all.
+- **An empty `choices` list raises `LLMError`**, not `IndexError` (LLM-4).
+- **Schema repair no longer replays tool messages without declaring tools** (NEW-10).
+- **A resumed agent's spend is checked against the budget** (COST-5).
+- **Tools stop with their agent.** On a timeout, cancellation, error or pause, tool calls
+  still running are cancelled and awaited, instead of finishing unobserved (LOOP-3: on real
+  ROS 2 a sibling `move` streamed 41 commands over 3.9 s after a cancel). A sync tool cannot
+  be cancelled inside its thread; it is now named in a warning (NEW-07).
+- **The iteration cap no longer throws the work away.** At `max_tool_iterations` the model
+  gets one last call without tools to answer from what it found (NEW-01: 19 of 19 real review
+  runs lost everything, 3.4 million tokens). If that fails too, `AgentError` carries
+  `tokens`, `cost` and the tool `trace`.
+- **Trimming keeps whole turns** (LOOP-2: 6 of 30 real requests sent tool results without
+  their call). An assistant message and its tool results are dropped together.
+- **`Literal` and other annotations work under `from __future__ import annotations`** (TOOL-1). Tool parameter annotations are resolved with `typing.get_type_hints` in the function's own module; before, a tool in a module with the future import and a `Literal` parameter failed at decoration with a `PydanticUserError`.
+- **Results stay with their call** when two calls share an id (NEW-03), and
+  `arguments: null` means no arguments instead of a crash (NEW-04).
+- **Human approval is decided per call.** Rejecting one blocked call used to let the other
+  blocked call in the same reply run anyway (HITL-1: on real ROS 2 the second `move` sent 10
+  commands after the rejection, 5/5). A rejection now stops the rest of the reply, reported
+  to the model as `[NOT RUN]`, and approving one call no longer approves the next: a later
+  blocked call pauses again.
+- **An approved call runs once.** Two concurrent `resume()` calls for one session used to run
+  the approved tool twice (HITL-2); the second is now refused with `PipelineError`. A
+  `resume()` retried after a failure used to run it again (HITL-3); the result is now recorded
+  as soon as the call returns and reused. A call that started and never recorded a result
+  raises `EffectUncertainError` unless `resume(..., on_in_doubt="skip" | "retry")` says what
+  to do.
+- **Two agents that pause in the same level are both resumed** before their dependents run.
+  The second pause used to be lost and the dependents ran without it (HITL-4).
+- **Pause state no longer leaks into agent prompts** (HITL-5): it lives in its own memory
+  namespace. A `datetime` (or any other schema type) in a completed sibling's output no longer
+  breaks persistence (HITL-6). Every tool call in the paused reply is answered after a resume,
+  so the next request stays valid for the provider (HITL-8).
+- **Supervisor workers obey the approval policy** (HITL-9). A blocked tool called by a worker
+  is refused with a `[BLOCKED]` observation, since a worker cannot pause the pipeline.
+- **Re-reading a sensor is no longer rejected** for `@tool(effect="read")` (LOOP-1).
+
+### Documented
+- A dependent of a skipped agent still runs without that agent's output in its context (PIPE-2). Optional fan-in depends on it, so it is now stated in `PUBLIC_API.md` instead of being left implicit.
+
+### Added
+- `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
+  `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
+  `InMemoryLedger` and `SqliteLedger`.
+- `Hooks.on_pipeline_error`, `Hooks.on_tool_error`, `PipelineResult.tool_errors`,
+  `Pipeline.serve(max_pending=, overflow=, max_age_s=)`.
+- `agentflow.testing` (opt-in): `ScriptedLLM`, `reply()` and `call()` run a pipeline against
+  a script at zero cost. It replaces only the provider round trip (`LLM._complete`, the new
+  replacement seam), so caching, budget reservation and accounting run as in production.
+- `LLM(temperature=None, max_tokens=None)` leave the parameter out of the request, which
+  reasoning models require (LLM-3), and `LLM(timeout=...)`.
+- `LLM(context_window=...)`: agents trim whole turns to fit the window and refuse a request
+  that cannot fit, instead of letting a local server truncate it silently (NEW-09: Ollama cut
+  two real requests by 21 to 22% without an error). An `LLM` pointed at a loopback address
+  without a `context_window` logs a warning.
+- `Agent(tool_output_max_chars=...)`, which was a hidden constant (NEW-08).
+- `AgentError.tokens`, `.cost` and `.trace`.
+- `Pipeline.resume(..., on_in_doubt="raise" | "retry" | "skip")` and
+  `pause_info["resumable"]`, which is `False` when the pipeline has an approval policy but no
+  memory backend (HITL-7; the constructor also warns).
+- `qos=` and `tls_context=` on `MQTTTrigger` and `MQTTDaemon`; reconnect backoff settings on
+  `MQTTTrigger`.
+
+### Changed
+- **`MQTTDaemon` debounces alarms** (decision 6, MQTT-2). Per topic, a new alarm fires at once
+  and a sustained one at most once per `cooldown_s` (default 30). At most `max_concurrent`
+  handlers run at once (default 5); an alarm that arrives while full is skipped and retried on
+  the next message. 500 messages of the same low-battery state used to start 500 pipelines.
+  Restore the old behaviour with `cooldown_s=0, max_concurrent=None`.
+- **`agentflow.swarm_routing` is deprecated** and will be removed in 0.9.0 (decision 8).
+  Importing it emits a `DeprecationWarning`. Its three distinguishing features do not work:
+  the depth cap is always fed `depth=0` (SWARM-3), structured upstream context crashes it
+  (SWARM-1), and cost state is shared across concurrent runs (SWARM-2). Use
+  `SupervisorAgent`. About 320 lines leave in 0.9.0.
+- **`LLM(timeout=120)`** instead of the SDK's 600 s (decision 5). On a real local 4B model, the
+  slowest of 493 calls took 34 s. Migration for very slow models: `LLM(timeout=600)`.
+- **An `LLM` subclass that overrides `generate` bypasses retries, pricing and the budget.**
+  Override `_complete` instead.
+- **Breaking: tool arguments are strict.** An unknown argument, or NaN or Infinity in a number,
+  is now refused with an error observation the model can correct, instead of being dropped or
+  passed to the tool (NEW-05, NEW-06). A speed limit the model asked for used to vanish
+  silently. Migration: declare every argument the tool accepts.
+- **The iteration cap makes one more, tool-free call**, which is billed like any other.
+- **Pause state is stored in a new place and format.** A run paused by 0.7.x cannot be resumed
+  by 0.8.0; resume or abandon paused runs before upgrading.
+- **Breaking: an agent that ran a tool without `effect` is not retried** by
+  `retry_failed_agents` (decision 4), because a retry could repeat that tool. The error
+  names the tools. Migration: mark each tool `effect="read"` or `effect="write"`.
+- **Breaking: a `write` tool must be `async`.** A sync function in a thread cannot be
+  cancelled and kept acting after a timeout (NEW-07). Opt-in, so no existing tool breaks.
+- **Breaking: an unpriced model with `budget_usd` set raises `PipelineError`** before the
+  first call (COST-4). A budget that cannot be measured is not a budget. Migration for local
+  models: `register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`. Without a budget
+  nothing changes (ADR 0003 still holds).
+- **`run_id` is 32 hex characters** (was 8). Eight collide at about 65k runs, and run-keyed
+  ledgers are coming in 0.8.0. Code that parses or truncates run ids should not assume a length.
+
+---
+
 ## [0.7.1] — 2026-10-29
 
 Repositioning and security hardening release for Systems, IoT, Edge AI, and

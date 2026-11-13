@@ -13,21 +13,73 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from .exceptions import AgentError, AgentOutputValidationError, ToolError
+from ._scope import report_tool_error, run_policy
+from .effects import current_effects, run_tool
+from .exceptions import AgentError, AgentOutputValidationError, EffectUncertainError, ToolError
 from .hitl import ApprovalPolicy, PauseExecution
-from .llm import LLM
+from .llm import LLM, _estimate_prompt_tokens
 from .memory import BaseMemory
-from .tools import Tool
+from .tools import InvalidArguments, Tool
 from .types import AgentResult
 
 DEFAULT_MAX_TOOL_ITERATIONS = 6
 TOOL_OUTPUT_MAX_CHARS = 5000
 MESSAGES_MAX_LENGTH = 20
-LLM_RETRIES_PER_ITERATION = 1
 MEMORY_SNIPPET_MAX_CHARS = 300
 DEFAULT_OUTPUT_RETRIES = 1
 
 _log = logging.getLogger("agentflow.agent")
+
+
+TOOL_CANCEL_GRACE_S = 2.0
+
+_FINAL_ANSWER_PROMPT = (
+    "You have used every tool call allowed for this task. Do not call any tool. "
+    "Answer now from what you have found so far, and say what is still missing."
+)
+
+
+def _turn_end(messages: list[dict[str, Any]], start: int) -> int:
+    """Index just past the turn at *start*: one message and the tool results after it."""
+    end = start + 1
+    while end < len(messages) and messages[end].get("role") == "tool":
+        end += 1
+    return end
+
+
+def _drop_oldest_turn(messages: list[dict[str, Any]]) -> bool:
+    """Drop the oldest whole turn after the system and user messages (LOOP-2).
+
+    An assistant message and all of its tool results go together, so no tool result is
+    ever left without its call. The latest turn is never dropped. Returns False when
+    nothing more can go.
+    """
+    start = 2
+    end = _turn_end(messages, start)
+    if start >= len(messages) or end >= len(messages):
+        return False
+    del messages[start:end]
+    return True
+
+
+def _normalized(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copies of *tool_calls* with ``arguments: null`` read as ``{}`` (NEW-04)."""
+    out = []
+    for call in tool_calls:
+        fn = call["function"]
+        if fn.get("arguments") is None:
+            call = {**call, "function": {**fn, "arguments": "{}"}}
+        out.append(call)
+    return out
+
+
+_HALTED = "[NOT RUN] batch halted after a rejected call"
+
+
+def _guarded(target: Any) -> bool:
+    """Whether the duplicate-call guard applies. Classified tools opt out (ADR 0006):
+    re-reading is normal, and repeating a command is a new effect."""
+    return target is None or target.effect is None
 
 
 def _truncate_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str:
@@ -115,10 +167,12 @@ class AgentSpec:
         memory: BaseMemory | None = None,
         system_prompt: str | None = None,
         output_retries: int = DEFAULT_OUTPUT_RETRIES,
+        tool_output_max_chars: int = TOOL_OUTPUT_MAX_CHARS,
     ):
         self.name = name
         self.role = role
         self._prompt_fn = prompt_fn
+        self._tool_output_max_chars = tool_output_max_chars
         self._output_schema = output_schema
         self._tools = tools or []
         self._max_tool_iterations = max_tool_iterations
@@ -171,7 +225,9 @@ class AgentSpec:
         # Run-scoped state: never mutate the (potentially shared) agent
         # instance for per-run values — concurrent pipelines share it.
         effective_session = session_id if session_id is not None else self._session_id
-        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
+        effective_policy = (
+            approval_policy if approval_policy is not None else self._approval_policy or run_policy()
+        )
         start = time.perf_counter()
         try:
             user_message = await self._prompt_fn(task, context)
@@ -211,13 +267,14 @@ class AgentSpec:
 
         metadata: dict[str, Any] = {}
         if self._tools:
-            content, tokens_used, cost, model_name, trace = await self._run_tool_loop(
+            content, tokens_used, cost, model_name, trace, finish_reason = await self._run_tool_loop(
                 messages, llm, approval_policy=effective_policy
             )
             metadata["model"] = model_name
             metadata["tool_calls"] = trace
             cached = False
         else:
+            self._fit_context(messages, llm, None)
             try:
                 response = await llm.generate(messages)
             except Exception as e:
@@ -227,7 +284,9 @@ class AgentSpec:
             cost = response.cost
             model_name = response.model
             cached = response.cached
+            finish_reason = response.finish_reason
             metadata["model"] = model_name
+        self._check_finish(content, finish_reason, metadata)
 
         # M3: Persist this agent's output back to memory for downstream agents.
         if self._memory is not None and content:
@@ -277,7 +336,8 @@ class AgentSpec:
         repair_tokens = 0
         repair_cost = 0.0
         attempts = max(self._output_retries, 0) + 1
-        conversation = messages
+        # The repair call declares no tools, so it must not replay tool turns (NEW-10).
+        conversation = [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")]
 
         for attempt in range(attempts):
             try:
@@ -329,7 +389,7 @@ class AgentSpec:
         initial_trace: list[dict[str, Any]] | None = None,
         initial_seen_calls: set[tuple[str, str]] | None = None,
         approval_policy: ApprovalPolicy | None = None,
-    ) -> tuple[str, int, float, str, list[dict[str, Any]]]:
+    ) -> tuple[str, int, float, str, list[dict[str, Any]], str | None]:
         """Drive a ReAct-style loop: call the LLM, run any requested tools, repeat.
 
         Features:
@@ -344,7 +404,7 @@ class AgentSpec:
         cost, trace, and seen-calls state.
 
         Returns:
-            (final_content, total_tokens, total_cost, model_name, tool_call_trace)
+            (final_content, total_tokens, total_cost, model_name, tool_call_trace, finish_reason)
         """
         tool_map = {t.name: t for t in self._tools}
         total_tokens = initial_total_tokens
@@ -354,89 +414,57 @@ class AgentSpec:
         seen_calls: set[tuple[str, str]] = initial_seen_calls or set()
 
         for iteration in range(start_iteration, self._max_tool_iterations):
-            # Per-iteration LLM retry for transient failures.
-            for retry in range(LLM_RETRIES_PER_ITERATION + 1):
-                try:
-                    response = await llm.generate(messages, tools=self._openai_tools)
-                    break
-                except Exception as exc:
-                    if retry == LLM_RETRIES_PER_ITERATION:
-                        raise AgentError(
-                            self.name,
-                            f"LLM call failed after {LLM_RETRIES_PER_ITERATION + 1} iteration-level attempts",
-                        ) from exc
-                    _log.warning(
-                        "LLM generation retry in agent %s (iteration %d, attempt %d)",
-                        self.name, iteration + 1, retry + 1,
-                    )
-                    await asyncio.sleep(0.5 * (2 ** retry))
+            self._fit_context(messages, llm, self._openai_tools)
+            # No retry here: LLM.generate is the one retry layer (LLM-1).
+            try:
+                response = await llm.generate(messages, tools=self._openai_tools)
+            except Exception as exc:
+                raise AgentError(
+                    self.name, f"LLM call failed: {exc}", tokens=total_tokens, cost=total_cost, trace=trace
+                ) from exc
 
             total_tokens += response.tokens
             total_cost += response.cost
             model_name = response.model
-            tool_calls = response.tool_calls
 
-            if not tool_calls:
-                return response.content, total_tokens, total_cost, model_name, trace
+            if not response.tool_calls:
+                return response.content, total_tokens, total_cost, model_name, trace, response.finish_reason
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.content or None,
-                    "tool_calls": tool_calls,
-                }
-            )
+            batch = _normalized(response.tool_calls)
+            messages.append({"role": "assistant", "content": response.content or None, "tool_calls": batch})
 
-            # Separate duplicate calls from new ones; duplicates get an
-            # immediate error observation without being re-executed.
-            results_map: dict[str, tuple[str, str, str, str]] = {}
-            coros: list[tuple[str, asyncio.Task[tuple[str, str, str, str]]]] = []
-            call_order: list[str] = []
+            # Results are kept by position in the batch, never by call id, so two
+            # calls that share an id each keep their own result (NEW-03).
+            results: list[tuple[str, str, str, str] | None] = [None] * len(batch)
+            tasks: dict[int, asyncio.Task[tuple[str, str, str, str]]] = {}
+            last_write: asyncio.Task[tuple[str, str, str, str]] | None = None
+            try:
+                for index, call in enumerate(batch):
+                    fn = call["function"]
+                    name = fn["name"]
+                    arguments = fn["arguments"]
+                    key = (name, arguments)
+                    target = tool_map.get(name)
+                    guarded = _guarded(target)
 
-            for call in tool_calls:
-                fn = call["function"]
-                name = fn["name"]
-                arguments = fn["arguments"]
-                key = (name, arguments)
-
-                if key in seen_calls:
-                    dup_msg = (
-                        f"Error: Duplicate tool call detected. You already called "
-                        f"'{name}' with these arguments. Try a different approach."
-                    )
-                    results_map[call["id"]] = (call["id"], name, arguments, dup_msg)
-                    _log.warning(
-                        "Duplicate tool call blocked in agent %s: %s(%s)",
-                        self.name, name, arguments[:120],
-                    )
-                else:
-                    # HITL: check approval policy before dispatching.
-                    if approval_policy is not None and approval_policy.requires_approval(
-                        name, arguments
-                    ):
-                        # Drain results for calls handled before the pause —
-                        # dispatched tasks would otherwise leak, and the saved
-                        # conversation must contain a tool message for every
-                        # already-processed call to stay API-valid on resume.
-                        for done_id, done_task in coros:
-                            results_map[done_id] = await done_task
-                        for done_id in call_order:
-                            _, dname, dargs, doutput = results_map[done_id]
-                            doutput = _truncate_output(doutput)
-                            trace.append(
-                                {"tool": dname, "arguments": dargs, "result": doutput}
-                            )
-                            messages.append(
-                                {"role": "tool", "tool_call_id": done_id, "content": doutput}
-                            )
-
-                        pending: list[dict[str, Any]] = []
-                        pause_idx = tool_calls.index(call)
-                        for rc in tool_calls[pause_idx:]:
-                            rfn = rc["function"]
-                            rkey = (rfn["name"], rfn["arguments"])
-                            if rkey not in seen_calls:
-                                pending.append(rc)
+                    if guarded and key in seen_calls:
+                        results[index] = (call["id"], name, arguments, (
+                            f"Error: Duplicate tool call detected. You already called "
+                            f"'{name}' with these arguments. Try a different approach."
+                        ))
+                        _log.warning(
+                            "Duplicate tool call blocked in agent %s: %s(%s)",
+                            self.name, name, arguments[:120],
+                        )
+                        continue
+                    if approval_policy is not None and approval_policy.requires_approval(name, arguments):
+                        # Finish what was dispatched before the pause, so the saved
+                        # conversation answers every call already made.
+                        for done_index, done_task in tasks.items():
+                            results[done_index] = await done_task
+                        for done in results[:index]:
+                            assert done is not None
+                            self._record(done, trace, messages)
                         raise PauseExecution(
                             agent_name=self.name,
                             tool_name=name,
@@ -447,40 +475,130 @@ class AgentSpec:
                             total_cost=total_cost,
                             model_name=model_name,
                             trace=trace,
-                            pending_calls=pending,
+                            # Every remaining call is pending, so each is answered on resume (HITL-8).
+                            pending_calls=list(batch[index:]),
                             seen_calls=[[n, a] for n, a in seen_calls],
                             iterations_used=iteration,
                         )
-                    seen_calls.add(key)
-                    coros.append(
-                        (call["id"], asyncio.create_task(self._execute_single_tool(call, tool_map)))
-                    )
-                call_order.append(call["id"])
+                    if guarded:
+                        seen_calls.add(key)
+                    if target is not None and target.effect == "write":
+                        # Side effects run one at a time, in the model's order (NEW-12).
+                        last_write = asyncio.create_task(self._after(last_write, call, tool_map))
+                        tasks[index] = last_write
+                    else:
+                        tasks[index] = asyncio.create_task(self._execute_single_tool(call, tool_map))
 
-            # Await all unique tool calls (they were dispatched concurrently).
-            if coros:
-                for cid, task in coros:
-                    results_map[cid] = await task
+                for index, task in tasks.items():
+                    results[index] = await task
+            finally:
+                # On a timeout, cancel, error or pause, no tool keeps running unobserved (LOOP-3).
+                await self._stop_tools(tasks, batch, tool_map)
 
-            # Append results in the original tool_calls order.
-            for call_id in call_order:
-                _, name, arguments, output = results_map[call_id]
-                output = _truncate_output(output)
-                trace.append({"tool": name, "arguments": arguments, "result": output})
-                messages.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": output}
+            for result in results:
+                assert result is not None
+                self._record(result, trace, messages)
+
+            while len(messages) > MESSAGES_MAX_LENGTH and _drop_oldest_turn(messages):
+                pass
+
+        return await self._final_answer(messages, llm, total_tokens, total_cost, trace)
+
+    def _check_finish(self, content: str, finish_reason: str | None, metadata: dict[str, Any]) -> None:
+        """Make truncation visible (NEW-02): an empty cut-off reply is an error, a partial one is marked."""
+        metadata["finish_reason"] = finish_reason
+        if finish_reason != "length":
+            return
+        if not (content or "").strip():
+            raise AgentError(
+                self.name,
+                "the reply was cut off by max_tokens before any answer (finish_reason=length); "
+                "raise max_tokens, or lower reasoning effort on a thinking model",
+            )
+        metadata["truncated"] = True
+        _log.warning("Reply of agent %s was cut off by max_tokens; the output is incomplete", self.name)
+
+    def _truncate(self, output: str) -> str:
+        return _truncate_output(output, self._tool_output_max_chars)
+
+    def _record(
+        self, result: tuple[str, str, str, str], trace: list[dict[str, Any]], messages: list[dict[str, Any]]
+    ) -> None:
+        call_id, name, arguments, output = result
+        output = self._truncate(output)
+        trace.append({"tool": name, "arguments": arguments, "result": output})
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+
+    def _fit_context(self, messages: list[dict[str, Any]], llm: LLM, tools: list[dict[str, Any]] | None) -> None:
+        """Trim whole turns until the request fits ``llm.context_window`` (NEW-09)."""
+        window = getattr(llm, "context_window", None)
+        if not window:
+            return
+        while (needed := _estimate_prompt_tokens(messages, tools)) > window:
+            if not _drop_oldest_turn(messages):
+                raise AgentError(
+                    self.name,
+                    f"the request needs about {needed} tokens, more than context_window={window}, "
+                    "even with every earlier turn dropped",
                 )
 
-            # Sliding window — keep system + user, drop oldest tool pairs
-            # when the message list grows too large.
-            if len(messages) > MESSAGES_MAX_LENGTH:
-                overflow = len(messages) - MESSAGES_MAX_LENGTH
-                messages[2:2 + overflow] = []
+    async def _stop_tools(
+        self,
+        tasks: dict[int, asyncio.Task[tuple[str, str, str, str]]],
+        batch: list[dict[str, Any]],
+        tool_map: dict[str, Any],
+    ) -> None:
+        running = [task for task in tasks.values() if not task.done()]
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.wait(running, timeout=TOOL_CANCEL_GRACE_S)
+        # Awaiting a task propagates the agent's own cancellation into it, so a tool may
+        # already be cancelled by the time we get here: check every task, not only these.
+        for index, task in tasks.items():
+            if not task.cancelled():
+                continue
+            name = batch[index]["function"]["name"]
+            target = tool_map.get(name)
+            if target is not None and not target._is_async:
+                _log.warning(
+                    "Tool %s in agent %s is still running after the agent stopped: a sync tool "
+                    "runs in a thread that cannot be cancelled. Make it async so it can stop.",
+                    name, self.name,
+                )
 
-        raise AgentError(
-            self.name,
-            f"exceeded max_tool_iterations={self._max_tool_iterations} without a final answer",
-        )
+    async def _final_answer(
+        self,
+        messages: list[dict[str, Any]],
+        llm: LLM,
+        total_tokens: int,
+        total_cost: float,
+        trace: list[dict[str, Any]],
+    ) -> tuple[str, int, float, str, list[dict[str, Any]], str | None]:
+        """At the iteration cap, ask once more without tools instead of discarding the work (NEW-01)."""
+        final = [*messages, {"role": "user", "content": _FINAL_ANSWER_PROMPT}]
+        limit = f"exceeded max_tool_iterations={self._max_tool_iterations} without a final answer"
+        try:
+            self._fit_context(final, llm, None)
+            response = await llm.generate(final)
+        except Exception as exc:
+            raise AgentError(self.name, limit, tokens=total_tokens, cost=total_cost, trace=trace) from exc
+        total_tokens += response.tokens
+        total_cost += response.cost
+        if not (response.content or "").strip():
+            raise AgentError(self.name, limit, tokens=total_tokens, cost=total_cost, trace=trace)
+        return response.content, total_tokens, total_cost, response.model, trace, response.finish_reason
+
+    async def _after(
+        self,
+        previous: asyncio.Task[tuple[str, str, str, str]] | None,
+        call: dict[str, Any],
+        tool_map: dict[str, Any],
+    ) -> tuple[str, str, str, str]:
+        """Run *call* once the previous write call in the batch has finished."""
+        if previous is not None:
+            await previous  # its failure propagates, so later writes never run after it
+        return await self._execute_single_tool(call, tool_map)
 
     async def _execute_single_tool(
         self, call: dict[str, Any], tool_map: dict[str, Any]
@@ -497,22 +615,28 @@ class AgentSpec:
         if target is None:
             output = f"Error: unknown tool '{name}'"
             _log.error("Unknown tool called in agent %s: %s", self.name, name)
+            report_tool_error(self.name, name, None, "unknown_tool", ToolError(name, "no such tool"))
         else:
             _log.info("Tool executing in agent %s: %s(%s)", self.name, name, arguments[:120])
             try:
-                output = await target.acall(arguments)
+                output = await run_tool(target, arguments, current_effects())
                 _log.info(
                     "Tool completed in agent %s: %s (output %d chars)",
                     self.name, name, len(output),
                 )
+            except EffectUncertainError:
+                raise  # the model cannot resolve this; stop the agent and ask a human
             except ToolError as e:
                 output = f"Error: {e}"
                 _log.error("Tool error in agent %s: %s — %s", self.name, name, e)
+                kind = "invalid_arguments" if isinstance(e, InvalidArguments) else "failed"
+                report_tool_error(self.name, name, target.effect, kind, e)
             except Exception as e:
                 output = f"Error: unexpected exception - {str(e)}"
                 _log.error(
                     "Unexpected exception in agent %s tool %s: %s", self.name, name, e,
                 )
+                report_tool_error(self.name, name, target.effect, "failed", e)
 
         return call["id"], name, arguments, output
 
@@ -525,6 +649,8 @@ class AgentSpec:
         *,
         session_id: str | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        prior_output: str | None = None,
+        on_executed: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
         """Resume execution after a :class:`~agentflow.hitl.PauseExecution`.
 
@@ -552,7 +678,9 @@ class AgentSpec:
         # Run-scoped state: never mutate the (potentially shared) agent
         # instance for per-run values — concurrent pipelines share it.
         effective_session = session_id if session_id is not None else self._session_id
-        effective_policy = approval_policy if approval_policy is not None else self._approval_policy
+        effective_policy = (
+            approval_policy if approval_policy is not None else self._approval_policy or run_policy()
+        )
         start = time.perf_counter()
         tool_map = {t.name: t for t in self._tools}
         messages: list[dict[str, Any]] = pause_data["messages"]
@@ -560,62 +688,69 @@ class AgentSpec:
         seen_calls: set[tuple[str, str]] = set(
             tuple(p) for p in pause_data.get("seen_calls", [])
         )
+        effects = current_effects()
+        if effects is not None:
+            effects.replay_history(tool_map, pause_data["trace"])
+
+        trace: list[dict[str, Any]] = pause_data["trace"]
+
+        def answer(call_id: str, name: str, args: str, output: str) -> None:
+            trace.append({"tool": name, "arguments": args, "result": output})
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
 
         if pending_calls:
             paused_call = pending_calls[0]
-            if approved:
-                call_id, name, args, output = await self._execute_single_tool(
-                    paused_call, tool_map
-                )
-                output = _truncate_output(output)
-                pause_data["trace"].append(
-                    {"tool": name, "arguments": args, "result": output}
-                )
-                messages.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": output}
-                )
+            pfn = paused_call["function"]
+            if not approved:
+                messages.append({"role": "tool", "tool_call_id": paused_call["id"], "content": human_feedback})
+                trace.append({"tool": pfn["name"], "arguments": pfn["arguments"],
+                              "result": f"[HUMAN REJECTED] {human_feedback}"})
+                # A rejection stops the whole batch: the rest was planned around it (HITL-1).
+                for call in pending_calls[1:]:
+                    fn = call["function"]
+                    answer(call["id"], fn["name"], fn["arguments"], _HALTED)
             else:
-                name = paused_call["function"]["name"]
-                args = paused_call["function"]["arguments"]
-                messages.append(
-                    {"role": "tool", "tool_call_id": paused_call["id"], "content": human_feedback}
-                )
-                pause_data["trace"].append(
-                    {
-                        "tool": name,
-                        "arguments": args,
-                        "result": f"[HUMAN REJECTED] {human_feedback}",
-                    }
-                )
-
-            for call in pending_calls[1:]:
-                fn = call["function"]
-                key = (fn["name"], fn["arguments"])
-                if key in seen_calls:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": (
-                                f"Error: Duplicate tool call detected. You already called "
-                                f"'{fn['name']}' with these arguments."
-                            ),
-                        }
-                    )
+                if prior_output is not None:
+                    # Recorded by an earlier resume, or skipped by the operator: never re-run.
+                    output = prior_output
                 else:
-                    seen_calls.add(key)
-                    cid, tname, targs, output = await self._execute_single_tool(
-                        call, tool_map
-                    )
-                    output = _truncate_output(output)
-                    pause_data["trace"].append(
-                        {"tool": tname, "arguments": targs, "result": output}
-                    )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": cid, "content": output}
-                    )
+                    _, _, _, output = await self._execute_single_tool(paused_call, tool_map)
+                    if on_executed is not None:
+                        await on_executed(output)
+                answer(paused_call["id"], pfn["name"], pfn["arguments"], self._truncate(output))
+                for index, call in enumerate(pending_calls[1:], start=1):
+                    fn = call["function"]
+                    key = (fn["name"], fn["arguments"])
+                    guarded = _guarded(tool_map.get(fn["name"]))
+                    if guarded and key in seen_calls:
+                        answer(call["id"], fn["name"], fn["arguments"],
+                               f"Error: Duplicate tool call detected. You already called "
+                               f"'{fn['name']}' with these arguments.")
+                        continue
+                    if effective_policy is not None and effective_policy.requires_approval(
+                        fn["name"], fn["arguments"]
+                    ):
+                        # Approving one call never approves the next (HITL-1).
+                        raise PauseExecution(
+                            agent_name=self.name,
+                            tool_name=fn["name"],
+                            tool_arguments=fn["arguments"],
+                            tool_call_id=call["id"],
+                            messages=messages,
+                            total_tokens=pause_data["total_tokens"],
+                            total_cost=pause_data["total_cost"],
+                            model_name=pause_data["model_name"],
+                            trace=trace,
+                            pending_calls=pending_calls[index:],
+                            seen_calls=[[n, a] for n, a in seen_calls],
+                            iterations_used=pause_data["iterations_used"],
+                        )
+                    if guarded:
+                        seen_calls.add(key)
+                    cid, tname, targs, output = await self._execute_single_tool(call, tool_map)
+                    answer(cid, tname, targs, self._truncate(output))
 
-        content, tokens_used, cost, model_name, final_trace = await self._run_tool_loop(
+        content, tokens_used, cost, model_name, final_trace, finish_reason = await self._run_tool_loop(
             messages,
             llm,
             start_iteration=pause_data["iterations_used"] + 1,
@@ -638,6 +773,7 @@ class AgentSpec:
             "model": model_name,
             "tool_calls": final_trace,
         }
+        self._check_finish(content, finish_reason, metadata)
         data: dict[str, Any] | None = None
         if self._output_schema is not None:
             data, content, repair_tokens, repair_cost = await self._validate_output(
@@ -727,10 +863,12 @@ class Agent:
         memory: BaseMemory | None = None,
         system_prompt: str | None = None,
         output_retries: int = DEFAULT_OUTPUT_RETRIES,
+        tool_output_max_chars: int = TOOL_OUTPUT_MAX_CHARS,
     ):
         self.name = name
         self.role = role
         self._output_schema = output_schema
+        self._tool_output_max_chars = tool_output_max_chars
         self._tools = tools
         self._max_tool_iterations = max_tool_iterations
         self._memory = memory
@@ -748,6 +886,7 @@ class Agent:
             memory=self._memory,
             system_prompt=self._system_prompt,
             output_retries=self._output_retries,
+            tool_output_max_chars=self._tool_output_max_chars,
         )
 
 

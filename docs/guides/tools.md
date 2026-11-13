@@ -48,11 +48,50 @@ for call in result.get("assistant").metadata["tool_calls"]:
     print(call["tool"], call["arguments"], "->", call["result"])
 ```
 
+## Declare what a tool does
+
+Say whether a tool only observes or changes the world:
+
+```python
+@tool(effect="read")
+async def get_pose() -> str: ...          # may be repeated, retried, run in parallel
+
+@tool(effect="write")
+async def move(linear: float, duration_s: float) -> str: ...   # recorded, never repeated
+```
+
+A `write` tool runs one call at a time in the order the model asked, and each call runs
+at most once per run: if the pipeline retries the agent, a call that already completed
+returns its stored result instead of acting again. Sending the same command twice is two
+calls and both run. A write tool must be `async`.
+
+A tool without `effect` behaves as in 0.7, with one difference: an agent that ran it is
+not retried by `retry_failed_agents`, because the retry could repeat it.
+
+If an earlier attempt started a write and never finished, the library cannot know whether
+it happened. It raises `EffectUncertainError` instead of guessing. To make this survive a
+restart, give the pipeline a durable ledger:
+
+```python
+from agentflow.effects import SqliteLedger
+
+pipe = Pipeline(llm=llm, retry_failed_agents=2, effect_ledger=SqliteLedger("effects.db"))
+```
+
+See [ADR 0004](../adr/0004-effect-ledger-for-side-effecting-tools.md) and
+[ADR 0006](../adr/0006-tool-effects.md).
+
 ## Error handling
 
 If a tool's arguments fail validation or the function raises, the error is fed
 back to the model as the tool result (prefixed `Error:`) so it can recover,
-rather than crashing the pipeline. A `ToolError` is raised only when you call a
+rather than crashing the pipeline. Validation is strict: an argument the tool
+does not declare, or NaN or Infinity in a number, is refused rather than dropped
+or passed on.
+
+Tool output longer than `tool_output_max_chars` (default 5000) is truncated with
+a marker. When the agent reaches `max_tool_iterations`, it gets one last call
+without tools to answer from what it found. A `ToolError` is raised only when you call a
 tool directly via `Tool.acall`.
 
 See the full API in the [reference](../reference.md).

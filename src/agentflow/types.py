@@ -112,6 +112,12 @@ class PipelineResult(BaseModel):
     agents_with_cache_hits: int = 0
     status: Literal["completed", "paused"] = "completed"
     pause_info: dict[str, Any] | None = None
+    tool_errors: list[dict[str, Any]] = Field(default_factory=list)
+    """Tool calls that failed, named a tool the agent does not have, or were refused for
+    invalid arguments: ``{"agent", "tool", "effect", "kind", "error"}`` with ``kind`` one of
+    ``"failed"``, ``"unknown_tool"``, ``"invalid_arguments"``. ``status`` stays
+    ``"completed"`` because the model usually recovers; this list is how a caller learns
+    that a write tool may have left the world in an unknown state."""
     unpriced_models: list[str] = Field(default_factory=list)
     """Models used in this run that have no entry in the pricing table.
 

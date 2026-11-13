@@ -94,9 +94,7 @@ def _make_fake_message(topic_str: str, payload_str: str, qos: int = 0):
     topic_obj.value = topic_str
     msg.topic = topic_obj
 
-    qos_obj = type("QoS", (), {})()
-    qos_obj.value = qos
-    msg.qos = qos_obj
+    msg.qos = qos  # aiomqtt 2.x: a plain int
 
     return msg
 
@@ -114,7 +112,7 @@ def _patch_aiomqtt(monkeypatch, message_generator):
         async def __aexit__(self, *args):
             pass
 
-        async def subscribe(self, topic: str):
+        async def subscribe(self, topic: str, qos: int = 0):
             self._subscribed.append(topic)
 
         @property
@@ -129,7 +127,7 @@ def _patch_aiomqtt(monkeypatch, message_generator):
 
     class _FakeMQTT:
         @staticmethod
-        def Client(hostname, port, username=None, password=None):
+        def Client(**kwargs):  # noqa: N802 - mirrors aiomqtt's public name
             return _FakeClient()
 
     import agentflow.triggers as triggers_mod

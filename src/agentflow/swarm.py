@@ -16,6 +16,7 @@ from .agent import (
     _truncate_output,
 )
 from .exceptions import AgentError
+from .hitl import PauseExecution
 from .llm import LLM
 from .tools import Tool
 from .types import AgentResult
@@ -216,6 +217,13 @@ class SupervisorAgent(BaseAgent):
                 )
             try:
                 result = await worker.execute(sub_task, {}, llm)
+            except PauseExecution as blocked:
+                # The run's policy reaches workers (HITL-9), but a worker inside a
+                # supervisor cannot pause the pipeline, so the call is refused.
+                return (
+                    f"[BLOCKED] worker '{worker_name}' tried '{blocked.tool_name}', which needs "
+                    "human approval; workers under a supervisor cannot ask for it. Not run."
+                )
             except Exception as e:
                 return f"Error: Worker '{worker_name}' failed — {e}"
             ledger.tokens += result.tokens_used

@@ -16,6 +16,7 @@ from agentflow import (
     tool,
 )
 from agentflow.exceptions import PipelineError
+from agentflow.pipeline import hitl_session
 
 # ── Test utilities ────────────────────────────────────────────────────────────
 
@@ -198,10 +199,11 @@ class TestPipelinePause:
         assert result.pause_info["agent_name"] == "assistant"
         assert result.pause_info["tool_name"] == "send_email"
 
-        # Verify state was saved to memory.
-        ctx = await mem.load_context(result.pause_info["session_id"])
-        assert "__hitl_pipeline" in ctx
-        assert "__hitl_agent" in ctx
+        # Verify state was saved to memory, in its own namespace (HITL-5).
+        ctx = await mem.load_context(hitl_session(result.pause_info["session_id"]))
+        assert "pipeline" in ctx
+        assert "pauses" in ctx
+        assert not any(k.startswith("__hitl") for k in await mem.load_context(result.pause_info["session_id"]))
 
     async def test_pipeline_does_not_pause_on_allowed_tool(self):
         """Tools not blocked by the policy execute normally."""
@@ -344,9 +346,9 @@ class TestPipelineResume:
         assert "delivered" in final_result.output.lower()
 
         # HITL keys should be cleaned up.
-        ctx = await mem.load_context(session_id)
-        assert "__hitl_pipeline" not in ctx
-        assert "__hitl_agent" not in ctx
+        ctx = await mem.load_context(hitl_session(session_id))
+        assert "pipeline" not in ctx
+        assert "pauses" not in ctx
 
     async def test_resume_rejected_injects_feedback(self):
         """Resume with approved=False injects human feedback, agent self-corrects."""
@@ -760,7 +762,7 @@ class TestHITLRegressions:
         events = [e async for e in pipe.stream("Send mail")]
         assert any(e.type == "pipeline_paused" for e in events)
 
-        ctx = await mem.load_context("fixed-session")
-        state = json.loads(ctx["__hitl_pipeline"])
+        ctx = await mem.load_context(hitl_session("fixed-session"))
+        state = json.loads(ctx["pipeline"])
         assert state["session_id"] == "fixed-session"
         assert state["run_id"] != "fixed-session"

@@ -44,7 +44,9 @@ register_price("my-finetuned-model", prompt_per_1m=0.50, completion_per_1m=1.50)
 
 ## Budgets
 
-`budget_usd` is a hard ceiling on a single run, checked after each DAG level.
+`budget_usd` is a hard ceiling on a single run. Every LLM call reserves its worst-case
+cost (estimated prompt plus `max_tokens`) before it is sent and settles to the billed
+amount after, so parallel agents and tool loops cannot run past it.
 The error carries the work that already completed, so tripping the ceiling does
 not throw away what you paid for:
 
@@ -62,8 +64,15 @@ for name, agent_result in result.results.items():
     print(name, agent_result.cost)
 ```
 
-An in-flight LLM call cannot be aborted, so a run may overshoot the ceiling by
-at most one level's spend.
+A reservation that does not fit waits for in-flight calls to settle, then the run
+stops. The stop is final for the run: agents that catch the error cannot keep
+spending, and the pipeline does not retry them. The total includes attempts whose
+result was discarded, such as a failed attempt that was retried.
+
+A budget needs a price for the model. A model without one raises `PipelineError`
+before the first call. For a local model, declare it free:
+`register_price("llama3.2", prompt_per_1m=0, completion_per_1m=0)`.
+See [ADR 0005](../adr/0005-hard-budget-by-reservation.md).
 
 ## Token streaming
 

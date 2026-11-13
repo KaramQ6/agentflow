@@ -18,7 +18,7 @@ in `agentflow.__all__`:
 | Memory | `BaseMemory`, `InMemoryContext`, `RedisContext`, `VectorContext` |
 | Ops | `RateLimiter`, `ResponseCache`, `InMemoryCache`, `RedisCache` |
 | Observability | `Hooks`, `LoggingHooks`, `PipelineLogger`, `get_logger` |
-| Exceptions | `AgentFlowError`, `AgentError`, `AgentTimeoutError`, `AgentOutputValidationError`, `BudgetExceededError`, `PipelineError`, `LLMError`, `ToolError` |
+| Exceptions | `AgentFlowError`, `AgentError`, `AgentTimeoutError`, `AgentOutputValidationError`, `BudgetExceededError`, `EffectUncertainError`, `PipelineError`, `LLMError`, `ToolError` |
 | HITL | `ApprovalPolicy`, `PauseExecution` |
 
 Covered semantics (not just names):
@@ -42,8 +42,32 @@ Covered semantics (not just names):
   `output_retries` times before raising
   (see [ADR 0002](docs/adr/0002-structured-output-via-prompt-and-repair.md)).
 - An unpriced model costs `0.0` and is reported in
-  `PipelineResult.unpriced_models`; it never raises
-  (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)).
+  `PipelineResult.unpriced_models`
+  (see [ADR 0003](docs/adr/0003-unpriced-models-report-zero-loudly.md)). It raises
+  only when `budget_usd` is set, because a budget must be measurable
+  (see [ADR 0005](docs/adr/0005-hard-budget-by-reservation.md)). *Changed in 0.8.0.*
+- `Hooks.on_pipeline_error` and `Hooks.on_tool_error` (no-op defaults) and
+  `PipelineResult.tool_errors` report failures that `status` does not. A started run
+  ends with `on_pipeline_end` or `on_pipeline_error`; `stream()` fires the same hooks as
+  `run()`. *Added in 0.8.0.*
+- `LLM.generate` is the one retry layer, for transient errors only. `AgentResult.metadata`
+  carries `finish_reason`, and `truncated` when a reply was cut off; an empty cut-off reply
+  raises. *Changed in 0.8.0.*
+- Tool arguments are validated strictly: unknown arguments and non-finite numbers are
+  refused. At `max_tool_iterations` the agent makes one last call without tools; if that
+  fails, `AgentError` carries `tokens`, `cost` and `trace`. *Changed in 0.8.0.*
+- HITL: each blocked call is approved on its own; a rejection stops the rest of that
+  reply's tool calls; an approved call runs at most once across `resume()` calls, and
+  `resume(on_in_doubt=...)` decides what happens to one that never recorded a result.
+  *Changed in 0.8.0.*
+- A dependent of a skipped agent still runs, and the skipped agent's output is simply absent from its
+  context: read it with `context.get(name)`. Optional fan-in needs this, so it is the contract and
+  not a bug (PIPE-2). *Documented in 0.8.0.*
+- `tool(effect=...)`: `"read"` tools may repeat and run concurrently; `"write"` tools run
+  one at a time in the model's order and at most once per occurrence in a run; an agent
+  that ran a tool without `effect` is not retried. See ADR 0006. *Added in 0.8.0.*
+- `budget_usd` is enforced by reserving each LLM call's worst-case cost before it
+  is sent, and its total includes discarded attempts. *Changed in 0.8.0.*
 - `LLM.generate(**extra)` forwards unknown keywords to the provider unchanged,
   and they participate in the cache key.
 - `depends_on` accepts forward references; unknown names raise when the graph
@@ -63,9 +87,10 @@ Importable by full path, excluded from the stability contract:
 - `agentflow.triggers` — event-driven triggers and the MQTT daemon
   (`BaseTrigger`, `MQTTTrigger`, `TriggerPolicy`, `PydanticTriggerPolicy`,
   `MQTTDaemon`)
-- `agentflow.swarm_routing` — `DynamicSupervisorAgent`, a supervisor with
-  Pydantic-generated delegation schemas, strict worker context isolation and
-  depth-capped delegation
+- `agentflow.swarm_routing` — `DynamicSupervisorAgent`. **Deprecated in 0.8.0,
+  removed in 0.9.0** (see below)
+- `agentflow.effects` — effect ledgers (`InMemoryLedger`, `SqliteLedger`)
+- `agentflow.testing` — `ScriptedLLM`, `reply`, `call` for tests
 - `agentflow.contrib.*` — third-party bridges (e.g. `contrib.otel.OTelHooks`)
 
 ## Current deprecations
@@ -81,6 +106,7 @@ Deprecated names emit `DeprecationWarning` as of 0.6.
 | `set_session` / `set_approval_policy` on agents | `execute(..., session_id=, approval_policy=)` — mutating shared instances is unsafe under concurrency | 1.0 |
 | The `_DecoratorAgent` name | `AgentSpec` (same class; renamed in 0.6) | 1.0 |
 | Top-level imports of sandbox/trigger names | Full-path imports (`agentflow.sandbox`, `agentflow.triggers`) | done in 0.6 |
+| `agentflow.swarm_routing` (`DynamicSupervisorAgent`) | `SupervisorAgent`. Its depth cap never fired (`depth=0` is hard-coded), it crashed on structured context, and it shared cost across runs. Importing it warns as of 0.8.0 | 0.9.0 |
 
 ## Deprecation policy
 
@@ -89,6 +115,23 @@ Deprecated names emit `DeprecationWarning` as of 0.6.
   release before removal in the next major.
 - Pre-1.0 caveat: breaking changes may land in minor versions, but only
   with an entry in CHANGELOG.md and a migration note in this file.
+
+## Migrating to 0.8.0
+
+0.8.0 changes behaviour in the places below. The pre-1.0 caveat above requires this note.
+The full list, with the reasons, is in [CHANGELOG.md](CHANGELOG.md).
+
+| If you... | Then 0.8.0... | Do |
+|---|---|---|
+| Set `budget_usd` with a model that has no registered price | Raises `PipelineError` before the first call | `register_price(model, 0, 0)` for a local model, or its real price |
+| Have tools that take fewer arguments than the model sends, or pass NaN or Infinity | Refuses the call with an error observation | Declare the argument, or let the model correct itself |
+| Use `retry_failed_agents` with tools that have no `effect` | Does not retry an agent that ran one | Set `effect="read"` or `effect="write"` on each tool |
+| Rely on a 600 s request timeout | Times out at 120 s | `LLM(timeout=600)` |
+| Have runs paused by 0.7.x | Cannot resume them | Resume or drop them before upgrading |
+| Run `MQTTDaemon` on a noisy topic | Fires once per alarm, then at most every 30 s, 5 at a time | `cooldown_s=0, max_concurrent=None` |
+| Import `agentflow.swarm_routing` | Warns, and removes it in 0.9.0 | `SupervisorAgent` |
+| Subclass `LLM` and override `generate` | Skips retries, pricing and the budget | Override `_complete` |
+| Parse or truncate `run_id` | Gets 32 hex characters, was 8 | Do not assume a length |
 
 ## What 1.0 requires
 
