@@ -29,8 +29,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "openai>=1.0.0",
-    "pydantic>=2.0.0",
+    # 1.55.3 is the first openai that works with httpx 0.28; 3.x moved to httpx2.
+    # The lowest pair is tested in CI (test-lowest), the newest by the main matrix.
+    "openai>=1.55.3,<4",
+    "pydantic>=2.0.0,<3",
 ]
 
 [project.optional-dependencies]
