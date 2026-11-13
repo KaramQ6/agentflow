@@ -6,8 +6,13 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import openai
+
+try:  # openai 3.x switched its HTTP client to httpx2; 1.x and 2.x use httpx
+    import httpx2 as httpx
+except ImportError:
+    import httpx
+
 import pytest
 from pydantic import BaseModel
 
