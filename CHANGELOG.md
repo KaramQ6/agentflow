@@ -9,19 +9,46 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Fixed
+---
 
+## [0.8.0] - 2026-11-13
+
+Correctness release. 0.7.1 passed its own tests while defects that only show against real
+services reproduced: a real MQTT broker, a real Docker daemon, real ROS 2 and a real local model.
+Each is fixed or documented below, with a regression test.
+
+**Upgrading from 0.7.x.** These change behaviour. Each has a migration:
+
+1. **A budget needs a priced model.** `budget_usd` with an unpriced model raises `PipelineError`
+   before the first call. Local models: `register_price("llama3.2", 0, 0)`.
+2. **Tool arguments are strict.** Unknown arguments and NaN or Infinity are refused with an error the
+   model can correct. Declare every argument a tool accepts.
+3. **`retry_failed_agents` skips agents that ran a tool without `effect`**, because a retry could repeat
+   it. Mark tools `effect="read"` or `effect="write"`.
+4. **`LLM(timeout=120)`** instead of the SDK's 600 s. Very slow models: `LLM(timeout=600)`.
+5. **Paused runs from 0.7.x cannot be resumed.** Pause state moved. Resume or drop them before upgrading.
+6. **`MQTTDaemon` debounces** (`cooldown_s=30`, `max_concurrent=5`). Old behaviour:
+   `cooldown_s=0, max_concurrent=None`.
+7. **`agentflow.swarm_routing` is deprecated**, removed in 0.9.0. Use `SupervisorAgent`.
+8. **An `LLM` subclass that overrides `generate`** bypasses retries, pricing and the budget. Override
+   `_complete` instead.
+9. **`run_id` is 32 hex characters**, was 8.
+10. **A write tool must be `async`** (opt-in, so no existing tool breaks).
+
+Also changed, without a migration: a rejected tool call stops the rest of its reply, approving one call
+no longer approves the next, a reply cut off by `max_tokens` with no content raises, and the iteration cap
+makes one more call without tools.
+
+### Fixed
 - **A run's total now includes every billed call.** An attempt that failed and was retried,
   timed out, or was cancelled by a failing sibling used to vanish from
   `PipelineResult.total_cost` and `total_tokens`, and from the budget check (COST-1). The
   spend of such attempts is now counted, including across a HITL pause and `resume()`.
   `AgentResult.cost` is unchanged: it still covers only the result it belongs to.
-
 - **`budget_usd` is a real ceiling.** It used to be checked once per DAG level, so a
   level of parallel agents overshot it tenfold and a tool loop never checked it at all
   (COST-2, COST-3). Every LLM call now reserves its worst-case cost before it is sent and
   settles after. A refusal is final for the run and is not retried. See ADR 0005.
-
 - **MQTT works against a real broker.** `MQTTTrigger` and `MQTTDaemon` crashed on the first
   real message: aiomqtt 2.x gives `qos` as an int, and the test fake gave an object (MQTT-4).
   Tests now also run against a real broker (`amqtt`) with the real client.
@@ -33,7 +60,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Windows: a clear error instead of a silent reconnect loop.** aiomqtt cannot run on the
   default Proactor loop. The daemon and the trigger now fail at once with a message, and
   `agentflow.triggers.run_mqtt(main())` runs a program on a loop that works.
-
 - **Sandbox: code written by a model could read the host's secrets.** `SubprocessSandbox`
   passed the whole host environment, API keys included, to the code it ran. It now passes
   only `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`, `TMPDIR` and `LANG`.
@@ -45,7 +71,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   variables.
 - The sandbox module docstring imported `sandboxed_tool` from `agentflow`, where it is not
   exported (SBX-2). It now imports from `agentflow.sandbox`.
-
 - **A retried agent no longer repeats a side effect.** `@tool(effect="write")` calls go
   through an effect ledger keyed by run, agent, tool, arguments and occurrence. A retry
   replays a completed call's result instead of acting again; a repeated command (the same
@@ -114,11 +139,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Re-reading a sensor is no longer rejected** for `@tool(effect="read")` (LOOP-1).
 
 ### Documented
-
 - A dependent of a skipped agent still runs without that agent's output in its context (PIPE-2). Optional fan-in depends on it, so it is now stated in `PUBLIC_API.md` instead of being left implicit.
 
 ### Added
-
 - `tool(effect="read" | "write")` and `Tool(effect=...)`, `EffectUncertainError`,
   `Pipeline(effect_ledger=...)`, and the opt-in module `agentflow.effects` with
   `InMemoryLedger` and `SqliteLedger`.
@@ -142,7 +165,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `MQTTTrigger`.
 
 ### Changed
-
 - **`MQTTDaemon` debounces alarms** (decision 6, MQTT-2). Per topic, a new alarm fires at once
   and a sustained one at most once per `cooldown_s` (default 30). At most `max_concurrent`
   handlers run at once (default 5); an alarm that arrives while full is skipped and retried on

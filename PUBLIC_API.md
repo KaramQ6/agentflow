@@ -116,6 +116,23 @@ Deprecated names emit `DeprecationWarning` as of 0.6.
 - Pre-1.0 caveat: breaking changes may land in minor versions, but only
   with an entry in CHANGELOG.md and a migration note in this file.
 
+## Migrating to 0.8.0
+
+0.8.0 changes behaviour in the places below. The pre-1.0 caveat above requires this note.
+The full list, with the reasons, is in [CHANGELOG.md](CHANGELOG.md).
+
+| If you... | Then 0.8.0... | Do |
+|---|---|---|
+| Set `budget_usd` with a model that has no registered price | Raises `PipelineError` before the first call | `register_price(model, 0, 0)` for a local model, or its real price |
+| Have tools that take fewer arguments than the model sends, or pass NaN or Infinity | Refuses the call with an error observation | Declare the argument, or let the model correct itself |
+| Use `retry_failed_agents` with tools that have no `effect` | Does not retry an agent that ran one | Set `effect="read"` or `effect="write"` on each tool |
+| Rely on a 600 s request timeout | Times out at 120 s | `LLM(timeout=600)` |
+| Have runs paused by 0.7.x | Cannot resume them | Resume or drop them before upgrading |
+| Run `MQTTDaemon` on a noisy topic | Fires once per alarm, then at most every 30 s, 5 at a time | `cooldown_s=0, max_concurrent=None` |
+| Import `agentflow.swarm_routing` | Warns, and removes it in 0.9.0 | `SupervisorAgent` |
+| Subclass `LLM` and override `generate` | Skips retries, pricing and the budget | Override `_complete` |
+| Parse or truncate `run_id` | Gets 32 hex characters, was 8 | Do not assume a length |
+
 ## What 1.0 requires
 
 1. The typed data plane finalized (`LLMResponse`, typed context contract).
